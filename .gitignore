@@ -1,0 +1,22 @@
+.venv/
+.pycache/
+__pycache__/
+*.py[cod]
+
+# Local runtime data
+comment_history.jsonl
+read_markers.jsonl
+*.log
+
+# Local configuration and private fixtures
+urls.txt
+comments.txt
+research_context.json
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/

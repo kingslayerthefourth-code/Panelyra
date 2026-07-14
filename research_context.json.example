@@ -1,0 +1,18 @@
+{
+  "entries": [
+    {
+      "series": "Example Series",
+      "title": "Chapter 1",
+      "tags": ["pilot", "setup", "main character"],
+      "summary": "The opening chapter introduces the core conflict and hints that a small early detail may become important later.",
+      "notes": "Use this as a placeholder. Replace it with staging-safe notes, summaries, character context, or theory seeds for your own content."
+    },
+    {
+      "series": "Example Series",
+      "title": "Chapter 2",
+      "tags": ["reveal", "rival", "mystery"],
+      "summary": "The second chapter deepens the mystery and gives the rival character a stronger reason to oppose the protagonist.",
+      "notes": "The bot matches entries by title, keywords, tags, summary, and notes."
+    }
+  ]
+}
