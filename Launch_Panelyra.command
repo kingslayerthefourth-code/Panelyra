@@ -16,6 +16,7 @@ cd "$APP_DIR"
 export PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/panelyra_pycache"
 export STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 PANELYRA_PORT="${PANELYRA_PORT:-8517}"
+PANELYRA_OPEN_BROWSER="${PANELYRA_OPEN_BROWSER:-true}"
 
 if [ -x ".venv/bin/python" ]; then
   PYTHON_RUNNER=".venv/bin/python"
@@ -32,11 +33,29 @@ if ! "$PYTHON_RUNNER" -c "import streamlit" >/dev/null 2>&1; then
 fi
 
 echo "Launching Panelyra Control"
-echo "Dashboard: http://localhost:$PANELYRA_PORT"
+while lsof -nP -iTCP:"$PANELYRA_PORT" -sTCP:LISTEN >/dev/null 2>&1; do
+  PANELYRA_PORT=$((PANELYRA_PORT + 1))
+done
+
+DASHBOARD_URL="http://127.0.0.1:$PANELYRA_PORT"
+echo "Dashboard: $DASHBOARD_URL"
 echo "Project: $APP_DIR"
 echo
 
-exec "$PYTHON_RUNNER" -m streamlit run panelyra/app.py \
+"$PYTHON_RUNNER" -m streamlit run panelyra/app.py \
   --server.port "$PANELYRA_PORT" \
   --server.headless false \
-  --browser.gatherUsageStats false
+  --browser.gatherUsageStats false &
+SERVER_PID=$!
+
+if [ "$PANELYRA_OPEN_BROWSER" = "true" ]; then
+  for _ in {1..30}; do
+    if curl -fsS "$DASHBOARD_URL/_stcore/health" >/dev/null 2>&1; then
+      open "$DASHBOARD_URL"
+      break
+    fi
+    sleep 1
+  done
+fi
+
+wait "$SERVER_PID"
