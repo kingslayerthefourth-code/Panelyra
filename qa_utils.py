@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -179,19 +181,39 @@ def build_comment(
     opening = random.choice(opening_phrases)
     subject = random.choice(subject_phrases)
     ending = random.choice(ending_phrases)
-    style = random.choice(("comma", "periods", "dash", "joiner"))
+    style = random.choice(("comma", "periods", "pause", "joiner", "question", "contrast", "specific"))
 
     if style == "comma":
         text = f"{opening}, {subject}, {ending}"
     elif style == "periods":
         text = f"{opening}. {maybe_sentence_case(subject)}. {maybe_sentence_case(ending)}"
-    elif style == "dash":
-        text = f"{opening} - {subject}; {ending}"
-    else:
+    elif style == "pause":
+        text = f"{opening}, {subject}; {ending}"
+    elif style == "joiner":
         text = f"{opening}, {subject} {random.choice(joiners)} {ending}"
+    elif style == "question":
+        text = f"{opening}, is anyone else thinking {subject}?"
+    elif style == "contrast":
+        text = f"{opening}, I expected one thing, but {subject} and now {ending}"
+    else:
+        text = f"What stood out most was how {subject}; {ending}"
 
     text = maybe_sentence_case(text).rstrip(".! ")
     return f"{text}{random.choice(punctuation)}"
+
+
+def comment_signature(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def comments_are_too_similar(candidate: str, previous: str) -> bool:
+    candidate_signature = comment_signature(candidate)
+    previous_signature = comment_signature(previous)
+    if not candidate_signature or not previous_signature:
+        return False
+    if candidate_signature == previous_signature:
+        return True
+    return SequenceMatcher(None, candidate_signature, previous_signature).ratio() >= 0.74
 
 
 def generate_unique_comment(
@@ -220,7 +242,7 @@ def generate_unique_comment(
             elif suffix_style == "bracketed":
                 text = f"{text} [{iteration + 1}]"
 
-        if text not in used_comments:
+        if not any(comments_are_too_similar(text, previous) for previous in used_comments):
             used_comments.add(text)
             return text
 

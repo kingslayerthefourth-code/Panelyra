@@ -1,12 +1,26 @@
 .venv/
 .pycache/
 __pycache__/
+.easyocr/
 *.py[cod]
 
 # Local runtime data
 comment_history.jsonl
 read_markers.jsonl
+owner_requests.jsonl
+assistant_feedback.jsonl
 *.log
+runs/
+failure_artifacts/
+backups/
+manhwa/
+test_reports/
+config/preferences.json
+config/workflow_presets.json
+config/selector_profiles.json
+outputs/
+Panelyra_GitHub/
+AsuraAutomation_GitHub/
 
 # Local configuration and private fixtures
 urls.txt

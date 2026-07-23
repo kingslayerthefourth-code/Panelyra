@@ -26,4 +26,4 @@ def read_jsonl_records(path: Path) -> list[dict[str, object]]:
 def append_jsonl_record(path: Path, record: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
