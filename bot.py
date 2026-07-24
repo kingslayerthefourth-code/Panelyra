@@ -200,6 +200,18 @@ EMOJI_STYLE_MAP = {
     "betrayal_watch": [" ☠"],
     "villain_watch": [" ☠"],
 }
+TEXT_EMOTICON_STYLE_MAP = {
+    "joke": [" :D", " xD"],
+    "comedy_timing": [" :D"],
+    "mystery": [" (o_o)", " (._.)"],
+    "suspicion": [" (o_o)"],
+    "theory": [" (._.)"],
+    "foreshadowing": [" (o_o)"],
+    "reaction": [" (^_^)"],
+    "cliffhanger": [" (T_T)"],
+    "emotional": [" (T_T)"],
+    "confusion": [" (o_o)"],
+}
 REFLECTION_EVERY_N_COMMENTS = 5
 COMMENT_SIMILARITY_LIMIT = 0.72
 COMMENT_TOKEN_OVERLAP_LIMIT = 0.68
@@ -2371,6 +2383,14 @@ def contextual_emoji(style: str, context: ChapterContext) -> str:
     return random.choice(choices)
 
 
+def contextual_text_emoticon(style: str, context: ChapterContext) -> str:
+    """Return a compact ASCII expression only when the reaction style supports it."""
+    choices = TEXT_EMOTICON_STYLE_MAP.get(style, [])
+    if not choices or not context_story_terms(context):
+        return ""
+    return random.choice(choices)
+
+
 def generated_comment_count(history: list[dict[str, object]]) -> int:
     return sum(1 for record in history if str(record.get("comment", "")).strip())
 
@@ -3042,9 +3062,13 @@ def build_contextual_comment(
         )
         emoji_used = False
         if not reflection_used and random.random() < 0.48:
-            emoji = contextual_emoji(style, context)
-            if emoji:
-                comment = f"{comment.rstrip('.!?')}{emoji}"
+            expression_options = [
+                expression
+                for expression in (contextual_emoji(style, context), contextual_text_emoticon(style, context))
+                if expression
+            ]
+            if expression_options:
+                comment = f"{comment.rstrip('.!?')}{random.choice(expression_options)}"
                 emoji_used = True
         comment = finalize_comment_text(comment)
         source_terms = set(context_story_terms(context))

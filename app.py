@@ -3144,8 +3144,8 @@ SCROLL_PRESETS = {
         "reuse_loaded_images": True,
         "cooldown_min_seconds": 0.0,
         "cooldown_max_seconds": 0.0,
-        "post_submit_wait_seconds": 0.5,
-        "description": "Maximum routing speed, immediate submission, and the shortest verification window.",
+        "post_submit_wait_seconds": 1.5,
+        "description": "Maximum routing speed and immediate submission with a short verification window.",
     },
     "Custom": {
         "min_px": 650,
