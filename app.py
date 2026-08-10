@@ -27,9 +27,13 @@ import streamlit as st
 from streamlit.components import v1 as components
 
 from automation_runtime import (
+    RUNS_DIR,
     RunRecord,
     RunStore,
+    TrackedProcessRef,
+    active_run_records,
     browser_lock_owner,
+    launch_macos_sleep_guard,
     list_run_records,
     normalize_web_url,
     preflight_url,
@@ -57,6 +61,7 @@ from panelyra.models.product import (
     runtime_type_for_page,
 )
 from panelyra.services.health import environment_health, format_bytes
+from panelyra.services.local_reader import start_local_reader_server
 from panelyra.services.paths import (
     DOWNLOADS_DIR,
     LEGACY_DOWNLOAD_DIR,
@@ -127,6 +132,121 @@ NOTE_ART_SELECTOR_DEFAULTS = {
         "button[data-testid*='save'], button[data-testid*='publish']"
     ),
 }
+
+
+def display_path(value: Path | str | None) -> str:
+    """Return a neutral, workspace-safe label for a local path shown in the UI."""
+    if value is None:
+        return "Not available"
+    path = Path(str(value)).expanduser()
+    try:
+        relative = path.resolve().relative_to(APP_DIR.resolve())
+    except (OSError, ValueError):
+        return path.name or "Local location"
+    if str(relative) == ".":
+        return "Panelyra workspace"
+    return f"Workspace/{relative.as_posix()}"
+
+
+def redact_private_paths(text: str) -> str:
+    """Prevent the local account name and absolute filesystem paths reaching the UI."""
+    redacted = str(text)
+    for private_root, replacement in (
+        (str(APP_DIR), "[Panelyra workspace]"),
+        (str(Path.home()), "[home]"),
+    ):
+        if private_root:
+            redacted = redacted.replace(private_root, replacement)
+    redacted = re.sub(r"/Users/[^/\s]+", "[home]", redacted)
+    redacted = re.sub(r"[A-Za-z]:\\\\Users\\\\[^\\\s]+", "[home]", redacted)
+    return redacted
+
+
+READER_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+
+def reader_sort_key(path: Path) -> tuple[int, int | str, str]:
+    """Sort zero-padded page/chapter folders numerically when possible."""
+    if path.stem.isdigit():
+        return (0, int(path.stem), path.name.lower())
+    return (1, path.stem.lower(), path.name.lower())
+
+
+def reader_catalog() -> dict[str, dict[str, object]]:
+    """Index local original and clean manhwa folders without exposing their paths."""
+    catalog: dict[str, dict[str, object]] = {}
+    roots = (
+        ("Original", DOWNLOADS_DIR),
+        ("Clean", APP_DIR / "manhwa_clean"),
+    )
+    for edition, root in roots:
+        if not root.is_dir():
+            continue
+        for series_dir in sorted((path for path in root.iterdir() if path.is_dir()), key=reader_sort_key):
+            series_key = series_dir.name.removesuffix("-clean")
+            chapter_map: dict[str, dict[str, object]] = {}
+            series_title = series_key.replace("-", " ").title()
+            for chapter_dir in sorted((path for path in series_dir.iterdir() if path.is_dir()), key=reader_sort_key):
+                images_dir = chapter_dir / "images"
+                if not images_dir.is_dir():
+                    continue
+                images = sorted(
+                    (path for path in images_dir.iterdir() if path.suffix.lower() in READER_IMAGE_SUFFIXES),
+                    key=reader_sort_key,
+                )
+                if not images:
+                    continue
+                metadata_path = chapter_dir / "metadata.json"
+                metadata: dict[str, object] = {}
+                if metadata_path.is_file():
+                    try:
+                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        metadata = {}
+                title = str(metadata.get("series_title") or series_title).strip()
+                if title:
+                    series_title = title
+                chapter_map[chapter_dir.name] = {
+                    "images": images,
+                    "title": str(metadata.get("title") or f"Chapter {chapter_dir.name}").strip(),
+                }
+            if chapter_map:
+                entry = catalog.setdefault(series_key, {"title": series_title, "editions": {}})
+                entry["title"] = series_title
+                editions = entry["editions"]
+                if isinstance(editions, dict):
+                    editions[edition] = chapter_map
+    return catalog
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_capture_page_count(root_value: str) -> int:
+    """Count captured image files without rescanning the library on every rerun."""
+    root = Path(root_value)
+    total = 0
+    if not root.exists():
+        return total
+    for metadata_path in root.rglob("metadata.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        images_dir = Path(str(metadata.get("images_dir") or metadata_path.parent / "images"))
+        if not images_dir.is_absolute():
+            images_dir = APP_DIR / images_dir
+        if images_dir.exists():
+            total += sum(
+                1
+                for item in images_dir.iterdir()
+                if item.is_file() and item.suffix.lower() in READER_IMAGE_SUFFIXES
+            )
+    return total
+
+
+@st.cache_resource(show_spinner=False)
+def local_reader_service():
+    """Start one loopback-only reader service for this local workspace."""
+    return start_local_reader_server(APP_DIR)
 
 
 def load_local_env_file(path: Path) -> None:
@@ -280,8 +400,10 @@ def read_log(log_path: Path, max_console_chars: int = MAX_CONSOLE_CHARS) -> str:
         text = log_file.read().decode("utf-8", errors="replace")
 
     if start_offset == 0 and len(text) <= max_console_chars:
-        return text
-    return f"... showing latest {max_console_chars:,} characters ...\n\n{text[-max_console_chars:]}"
+        return redact_private_paths(text)
+    return redact_private_paths(
+        f"... showing latest {max_console_chars:,} characters ...\n\n{text[-max_console_chars:]}"
+    )
 
 
 def parse_bot_progress(log_text: str) -> dict[str, int | str]:
@@ -824,7 +946,7 @@ def latest_log_findings(log_path: Path | None, max_lines: int = 8) -> list[str]:
     if log_path is None:
         return ["No run log is available yet."]
     if not log_path.exists():
-        return [f"Configured log path does not exist: {log_path}"]
+        return [f"Configured log is unavailable: {display_path(log_path)}"]
 
     text = read_log(log_path, 40_000)
     keywords = ("error", "warning", "exception", "traceback", "failed", "timeout", "not found", "blocked")
@@ -898,7 +1020,7 @@ def diagnose_user_problem(prompt: str, records: list[dict[str, object]], status_
         f"- Bot state: {status_label}.",
         f"- Submitted comments in history: {len(submitted_records)}.",
         f"- Failed history records: {len(failed_records)}.",
-        f"- Latest log path: {st.session_state.log_path or 'none yet'}.",
+        f"- Latest log: {display_path(st.session_state.log_path) if st.session_state.log_path else 'none yet'}.",
         "",
         "Latest log findings:",
         *[f"- {finding}" for finding in findings],
@@ -943,14 +1065,14 @@ def openai_api_key_help() -> str:
         f"Current app status: `OPENAI_API_KEY` is **{key_status}**.\n\n"
         "Recommended for this project:\n\n"
         "```bash\n"
-        f"cd \"{APP_DIR}\"\n"
-        "printf 'OPENAI_API_KEY=sk-your-real-key-here\\n' > .env\n"
+        "cd /path/to/Panelyra\n"
+        "printf 'OPENAI_API_KEY=your-key-here\\n' > .env\n"
         "```\n\n"
-        "Then restart Streamlit or the macOS launcher. The app loads `.env` only when it starts.\n\n"
+        "Then restart Streamlit or the Panelyra launcher. The app loads `.env` only when it starts.\n\n"
         "One-time Terminal option:\n\n"
         "```bash\n"
-        f"cd \"{APP_DIR}\"\n"
-        "export OPENAI_API_KEY=\"sk-your-real-key-here\"\n"
+        "cd /path/to/Panelyra\n"
+        "export OPENAI_API_KEY=\"your-key-here\"\n"
         "streamlit run app.py\n"
         "```\n\n"
         "Keep the key private. Do not paste the real key into the assistant chat, comments, GitHub, screenshots, or support requests. "
@@ -1095,7 +1217,7 @@ def local_app_help_response(prompt: str, records: list[dict[str, object]], statu
         sections.append(
             "**Settings Page**\n\n"
             "- `Compact UI`: reduces spacing.\n"
-            "- `Show paths in sidebar`: exposes app/log paths for debugging.\n"
+            "- `Show workspace details in sidebar`: shows neutral workspace/log labels for debugging.\n"
             "- `Console characters`: controls how much log text each Live Room displays.\n"
             "- `Auto-refresh seconds`: controls refresh speed while the bot is running.\n"
             "- `Quote/philosophy cadence`: controls how often a quote/philosophical style is added.\n"
@@ -1275,6 +1397,15 @@ def launch_tracked_process(
         start_new_session=True,
         env=environment,
     )
+    sleep_guard = (
+        launch_macos_sleep_guard(process.pid)
+        if bot_type in {"comment", "download"}
+        else None
+    )
+    if sleep_guard is not None:
+        log_handle.write(
+            f"macOS sleep protection active for {bot_type} process {process.pid}.\n"
+        )
     log_handle.close()
     store.update(status="running", stage="process-started", pid=process.pid)
     st.session_state.run_record_paths[bot_type] = str(store.path)
@@ -1395,7 +1526,7 @@ def start_bot(
 
     startup_banner = (
         "Starting bot process...\n"
-        f"Working directory: {APP_DIR}\n"
+        "Working directory: Panelyra workspace\n"
         f"Python: {python_executable}\n"
         f"Command: {' '.join(command)}\n\n"
     )
@@ -1473,7 +1604,7 @@ def start_note_art_bot(
 
     startup_banner = (
         "Starting word-art note process...\n"
-        f"Working directory: {APP_DIR}\n"
+        "Working directory: Panelyra workspace\n"
         f"Python: {python_executable}\n"
         f"Command: {' '.join(command)}\n\n"
     )
@@ -1493,6 +1624,7 @@ def start_note_art_bot(
 def start_manhwa_ocr_bot(
     start_url: str,
     max_chapters: int,
+    wait_for_inspection: bool,
     output_dir: str,
     content_container_selector: str,
     ocr_image_selector: str,
@@ -1508,11 +1640,17 @@ def start_manhwa_ocr_bot(
     next_page_selector: str,
     page_counter_selector: str,
     chapter_list_selector: str,
-) -> tuple[subprocess.Popen, Path, None]:
+    performance_profile: str,
+) -> tuple[subprocess.Popen, Path, Optional[Path]]:
     start_url = normalize_web_url(start_url)
     max_chapters = max(1, min(20, int(max_chapters)))
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     log_path = LOG_DIR / f"manhwa-ocr-{timestamp}.log"
+    signal_path = (
+        LOG_DIR / f"capture-start-{timestamp}-{uuid.uuid4().hex}.txt"
+        if wait_for_inspection
+        else None
+    )
     python_executable = str(BOT_PYTHON if BOT_PYTHON.exists() else Path(sys.executable))
     command = [
         python_executable,
@@ -1545,9 +1683,13 @@ def start_manhwa_ocr_bot(
         page_counter_selector,
         "--chapter-list-selector",
         chapter_list_selector,
+        "--performance-profile",
+        performance_profile.lower(),
     ]
     if save_images:
         command.append("--save-images")
+    if signal_path:
+        command.extend(["--start-signal-file", str(signal_path)])
     if not create_archive:
         command.append("--skip-cbz")
     if not save_ocr:
@@ -1555,7 +1697,7 @@ def start_manhwa_ocr_bot(
 
     startup_banner = (
         "Starting Panelyra Capture process...\n"
-        f"Working directory: {APP_DIR}\n"
+        "Working directory: Panelyra workspace\n"
         f"Python: {python_executable}\n"
         f"Command: {' '.join(command)}\n\n"
     )
@@ -1569,12 +1711,13 @@ def start_manhwa_ocr_bot(
             "max_chapters": max_chapters,
             "output_dir": output_dir,
             "reader_layout": reader_layout,
+            "wait_for_inspection": wait_for_inspection,
         },
     )
     st.session_state.bot_runtimes["download"] = {
-        "process": process, "log_path": log_path, "signal_path": None, "paused": False
+        "process": process, "log_path": log_path, "signal_path": signal_path, "paused": False
     }
-    return process, log_path, None
+    return process, log_path, signal_path
 
 
 def inject_styles() -> None:
@@ -2486,6 +2629,29 @@ def inject_styles() -> None:
         div.stButton > button {
             min-height: 2.65rem;
             box-shadow: inset 0 1px rgba(255,255,255,0.07), 0 8px 20px rgba(0,0,0,0.20);
+        }
+        /* Keep comic panels continuous while leaving image spacing elsewhere intact. */
+        .st-key-reader_pages,
+        .st-key-reader_pages > div[data-testid="stVerticalBlock"] {
+            gap: 0 !important;
+        }
+        .st-key-reader_pages div[data-testid="stElementContainer"],
+        .st-key-reader_pages div[data-testid="stImage"],
+        .st-key-reader_pages [data-testid="stImage"] > div {
+            width: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            line-height: 0 !important;
+        }
+        .st-key-reader_pages div[data-testid="stElementContainer"] {
+            display: flex !important;
+            justify-content: center !important;
+        }
+        .st-key-reader_pages img {
+            display: block !important;
+            width: 100% !important;
+            height: auto !important;
+            margin: 0 auto !important;
         }
         @media (max-width: 760px) {
             .block-container {
@@ -3420,7 +3586,8 @@ def initialize_session_state() -> None:
         "ocr_custom_output_dir": "",
         "ocr_save_images": True,
         "ocr_create_archive": True,
-        "ocr_save_text": True,
+        "ocr_save_text": False,
+        "ocr_performance_profile": "Balanced",
         "ocr_max_chapters": 1,
         "ocr_reader_layout": "auto",
         "ocr_selector_profile": "Generic chapter reader",
@@ -3430,6 +3597,9 @@ def initialize_session_state() -> None:
         "ocr_scroll_min_delay": 0.08,
         "ocr_scroll_max_delay": 0.18,
         "ocr_image_fetch_timeout": 20.0,
+        "reader_series": "",
+        "reader_edition": "Original",
+        "reader_chapter": "",
         "assistant_open": False,
         "assistant_messages": [],
         "assistant_prompt": "",
@@ -3464,6 +3634,27 @@ def initialize_session_state() -> None:
         st.session_state.page = "Dashboard"
 
 
+def restore_active_runtime_references() -> None:
+    """Reconnect a new Streamlit session to bots launched by another session."""
+    for bot_type, record in active_run_records().items():
+        runtime = st.session_state.bot_runtimes.get(bot_type)
+        if runtime is None or is_process_running(runtime.get("process")):
+            continue
+        pid = int(record.get("pid", 0) or 0)
+        process = TrackedProcessRef(pid)
+        runtime["process"] = process
+        runtime["log_path"] = Path(str(record.get("log_path", "")))
+        runtime["signal_path"] = None
+        runtime["paused"] = False
+        run_id = str(record.get("run_id", "")).strip()
+        if run_id:
+            st.session_state.run_record_paths[bot_type] = str(RUNS_DIR / f"{run_id}.json")
+        if bot_type == "comment":
+            st.session_state.bot_process = process
+            st.session_state.log_path = runtime["log_path"]
+            st.session_state.start_signal_path = None
+
+
 st.set_page_config(
     page_title=f"{PRODUCT_NAME} Control",
     page_icon="P",
@@ -3471,6 +3662,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 initialize_session_state()
+restore_active_runtime_references()
 preserve_wizard_state()
 inject_styles()
 render_scroll_to_top_trigger()
@@ -3693,12 +3885,12 @@ with st.sidebar:
                 st.rerun()
     if st.session_state.show_sidebar_paths:
         st.divider()
-        st.caption("App folder")
-        st.code(str(APP_DIR), language="text")
+        st.caption("Workspace")
+        st.code("Panelyra workspace", language="text")
         active_log = st.session_state.bot_runtimes.get(page_bot_type, {}).get("log_path") if page_bot_type else None
         if active_log:
-            st.caption("Workspace log")
-            st.code(str(active_log), language="text")
+            st.caption("Active log")
+            st.code(display_path(active_log), language="text")
 
 page = st.session_state.page
 history_records = read_history()
@@ -3749,19 +3941,7 @@ if route_page == "Overview":
                 st.rerun()
 
     run_records = list_run_records(limit=100)
-    capture_pages = 0
-    for metadata_path in OCR_DOWNLOAD_DIR.rglob("metadata.json"):
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        images_dir = Path(str(metadata.get("images_dir") or metadata_path.parent / "images"))
-        if images_dir.exists():
-            capture_pages += sum(
-                1
-                for item in images_dir.iterdir()
-                if item.is_file() and item.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-            )
+    capture_pages = cached_capture_page_count(str(OCR_DOWNLOAD_DIR))
     recent_failures = sum(
         1
         for record in run_records[:20]
@@ -4236,13 +4416,19 @@ elif route_page == "Capture Setup":
             st.text_input(
                 "Custom output folder",
                 key="ocr_custom_output_dir",
-                placeholder=str(OCR_DOWNLOAD_DIR),
+                placeholder="Default: Workspace/manhwa",
             )
             output_path = Path(
                 str(st.session_state.ocr_custom_output_dir).strip() or str(OCR_DOWNLOAD_DIR)
             ).expanduser()
-            st.caption(f"Output: {output_path}")
+            st.caption(f"Output: {display_path(output_path)}")
         with output_columns[1]:
+            st.selectbox(
+                "Capture performance",
+                options=["Balanced", "Rapid", "Reliable"],
+                key="ocr_performance_profile",
+                help="Balanced is recommended. Rapid reduces completeness waits and uses more parallel downloads; Reliable waits longer for difficult lazy-loaded readers.",
+            )
             st.slider(
                 "OCR confidence",
                 min_value=0.05,
@@ -4343,25 +4529,25 @@ elif route_page == "Capture Setup":
         ]
         capture_metrics[3].metric("Outputs", ", ".join(selected_outputs) or "Metadata")
         st.code(str(st.session_state.ocr_start_url), language="text")
-        st.caption(f"Output: {effective_ocr_output_dir}")
+        st.caption(f"Output: {display_path(effective_ocr_output_dir)}")
+        st.caption(
+            "Capture uses a dedicated persistent Chrome profile. Select Review in Browser "
+            "when authentication or manual reader verification is required."
+        )
         if capture_blockers:
             st.warning("Before starting: " + "; ".join(capture_blockers) + ".")
         else:
             st.success("Configuration is ready.")
-        review_navigation = st.columns([1, 2])
+        review_navigation = st.columns([1, 2, 2])
         if review_navigation[0].button("Back", key="capture_review_back", width="stretch"):
             st.session_state.capture_setup_step = 2
             st.rerun()
-        if review_navigation[1].button(
-            "Start capture",
-            key="capture_start",
-            type="primary",
-            disabled=running or bool(capture_blockers),
-            width="stretch",
-        ):
+
+        def launch_capture(wait_for_inspection: bool) -> None:
             st.session_state.bot_process, st.session_state.log_path, st.session_state.start_signal_path = start_manhwa_ocr_bot(
                 str(st.session_state.ocr_start_url).strip(),
                 int(st.session_state.ocr_max_chapters),
+                wait_for_inspection,
                 effective_ocr_output_dir,
                 effective_ocr_container_selector,
                 effective_ocr_image_selector,
@@ -4377,9 +4563,28 @@ elif route_page == "Capture Setup":
                 str(st.session_state.ocr_next_page_selector).strip(),
                 str(st.session_state.ocr_page_counter_selector).strip(),
                 str(st.session_state.ocr_chapter_list_selector).strip(),
+                str(st.session_state.ocr_performance_profile),
             )
             set_page("Capture Live")
             st.rerun()
+
+        inspect_clicked = review_navigation[1].button(
+            "Review in Browser",
+            key="capture_prepare",
+            disabled=running or bool(capture_blockers),
+            width="stretch",
+        )
+        direct_clicked = review_navigation[2].button(
+            "Start Capture",
+            key="capture_start",
+            type="primary",
+            disabled=running or bool(capture_blockers),
+            width="stretch",
+        )
+        if inspect_clicked:
+            launch_capture(True)
+        if direct_clicked:
+            launch_capture(False)
 
 elif route_page == "Studio Setup":
     word_art_runtime = st.session_state.bot_runtimes["word_art"]
@@ -4633,18 +4838,29 @@ elif route_page == "Capture Live":
     completion = min(1.0, float(progress["current"]) / max(1, int(progress["target"])))
     st.progress(completion, text=f"Chapter progress: {progress['current']} of {progress['target'] or 'pending'}")
     st.info(str(record.get("message") or record.get("stage") or "Waiting for a run to start."))
-    actions = st.columns(3)
+    actions = st.columns(4)
+    if actions[0].button(
+        "Begin Capture" if runtime.get("signal_path") else "Browser Review Complete",
+        type="primary",
+        disabled=not running or runtime.get("signal_path") is None,
+        width="stretch",
+    ):
+        Path(runtime["signal_path"]).write_text("start\n", encoding="utf-8")
+        runtime["signal_path"] = None
+        st.session_state.start_signal_path = None
+        st.toast("Capture initiated from the active browser page.")
+        st.rerun()
     pause_label = "Resume" if runtime.get("paused") else "Pause"
-    if actions[0].button(pause_label, disabled=not running, width="stretch"):
+    if actions[1].button(pause_label, disabled=not running, width="stretch"):
         changed = resume_bot(runtime.get("process")) if runtime.get("paused") else pause_bot(runtime.get("process"))
         if changed:
             runtime["paused"] = not runtime.get("paused", False)
             st.rerun()
-    if actions[1].button("Stop", disabled=not running, width="stretch"):
+    if actions[2].button("Stop", disabled=not running, width="stretch"):
         stop_bot(runtime.get("process"))
         runtime["paused"] = False
         st.rerun()
-    if actions[2].button("Open output", width="stretch"):
+    if actions[3].button("Open output", width="stretch"):
         output_path = Path(st.session_state.ocr_custom_output_dir.strip() or OCR_DOWNLOAD_DIR)
         output_path.mkdir(parents=True, exist_ok=True)
         subprocess.run(["open", str(output_path)], check=False)
@@ -4706,6 +4922,72 @@ elif route_page == "Studio Live":
     with st.expander("Diagnostics", expanded=False):
         st.code(log_text, language="text")
 
+elif route_page == "Reader":
+    render_page_header(
+        "Reader",
+        "Read locally collected chapters in their original continuous vertical format.",
+        ["Vertical reading", "Original and clean editions", "Local files"],
+    )
+    catalog = reader_catalog()
+    if not catalog:
+        st.info("No chapter images are available yet. Run Capture first, then return here to read them.")
+    else:
+        series_options = sorted(catalog, key=lambda key: str(catalog[key]["title"]).lower())
+        if st.session_state.reader_series not in series_options:
+            st.session_state.reader_series = series_options[0]
+        selected_series = st.selectbox(
+            "Series",
+            options=series_options,
+            key="reader_series",
+            format_func=lambda key: str(catalog[key]["title"]),
+        )
+        selected_entry = catalog[selected_series]
+        editions = selected_entry["editions"]
+        edition_options = [edition for edition in ("Original", "Clean") if edition in editions]
+        if st.session_state.reader_edition not in edition_options:
+            st.session_state.reader_edition = edition_options[0]
+        st.radio(
+            "Edition",
+            options=edition_options,
+            key="reader_edition",
+            horizontal=True,
+            help="Clean removes verified promotional bands while preserving the original source files.",
+        )
+        chapters = editions[st.session_state.reader_edition]
+        chapter_options = sorted(chapters, key=lambda value: (0, int(value)) if value.isdigit() else (1, value))
+        if st.session_state.reader_chapter not in chapter_options:
+            st.session_state.reader_chapter = chapter_options[0]
+
+        navigation = st.columns([1, 2, 1])
+        current_index = chapter_options.index(st.session_state.reader_chapter)
+        if navigation[0].button("Previous", disabled=current_index == 0, width="stretch"):
+            st.session_state.reader_chapter = chapter_options[current_index - 1]
+            request_scroll_to_top()
+            st.rerun()
+        navigation[1].selectbox(
+            "Chapter",
+            options=chapter_options,
+            key="reader_chapter",
+            format_func=lambda value: f"Chapter {value}",
+        )
+        if navigation[2].button("Next", disabled=current_index == len(chapter_options) - 1, width="stretch"):
+            st.session_state.reader_chapter = chapter_options[current_index + 1]
+            request_scroll_to_top()
+            st.rerun()
+
+        chapter = chapters[st.session_state.reader_chapter]
+        images = chapter["images"]
+        st.caption(
+            f"{st.session_state.reader_edition} edition · Chapter {st.session_state.reader_chapter} · {len(images)} image(s)"
+        )
+        reader_url = local_reader_service().reader_url(
+            st.session_state.reader_edition,
+            selected_series,
+            st.session_state.reader_chapter,
+        )
+        st.link_button("Open immersive reader", reader_url, type="primary", width="stretch")
+        st.caption("Opens a local, distraction-free reader with resume position, width modes, keyboard controls, and zero panel spacing.")
+
 elif route_page == "Capture Library":
     render_page_header(
         "Capture Library",
@@ -4740,12 +5022,17 @@ elif route_page == "Capture Library":
                     "Chapter": metadata.get("title", metadata_file.parent.name),
                     "Images": actual_images,
                     "OCR characters": metadata.get("character_count", 0),
-                    "Images folder": str(images_dir),
-                    "CBZ": archive if Path(archive).exists() else "not created",
+                    "Images folder": display_path(images_dir),
+                    "CBZ": display_path(Path(archive)) if Path(archive).exists() else "not created",
+                    "_images_dir": str(images_dir),
                 }
             )
-        st.dataframe(library_rows, width="stretch", hide_index=True)
-        latest_images_dir = Path(library_rows[0]["Images folder"]) if library_rows else OCR_DOWNLOAD_DIR
+        st.dataframe(
+            [{key: value for key, value in row.items() if not key.startswith("_")} for row in library_rows],
+            width="stretch",
+            hide_index=True,
+        )
+        latest_images_dir = Path(library_rows[0]["_images_dir"]) if library_rows else OCR_DOWNLOAD_DIR
         actions = st.columns(3)
         if actions[0].button("Open Latest Images", width="stretch"):
             subprocess.run(["open", str(latest_images_dir)], check=False)
@@ -4882,7 +5169,7 @@ elif route_page == "Run History":
     )
     status_filter = filter_columns[2].selectbox(
         "Status",
-        options=["All", "running", "completed", "failed", "stopped"],
+        options=["All", "running", "completed", "partial", "failed", "stopped"],
     )
     bot_values = {"Engage": "comment", "Capture": "download", "Studio": "word_art"}
     if bot_filter != "All":
@@ -4918,9 +5205,9 @@ elif route_page == "Run History":
                 cols[3].metric("Updated", time.strftime("%Y-%m-%d %H:%M", time.localtime(record.get("updated_at", 0))))
                 if record.get("stop_reason"):
                     st.error(str(record["stop_reason"]))
-                st.code(json.dumps(record.get("settings", {}), indent=2), language="json")
+                st.code(redact_private_paths(json.dumps(record.get("settings", {}), indent=2)), language="json")
                 if record.get("log_path"):
-                    st.caption(str(record["log_path"]))
+                    st.caption(display_path(record["log_path"]))
                 if st.button(
                     "Retry from saved configuration",
                     key=f"retry_{record.get('run_id', uuid.uuid4().hex)}",
@@ -5052,7 +5339,7 @@ elif route_page == "Storage":
         "Capture downloads, Studio assets, history, read markers, and legacy OCR output are protected. "
         "Panelyra never deletes those areas automatically."
     )
-    st.caption(f"Migration rollback: {APP_DIR / 'backups' / 'pre_panelyra_20260723'}")
+    st.caption("Migration rollback snapshot is stored in the Panelyra workspace.")
 
 elif route_page == "Settings":
     render_page_header(
@@ -5077,7 +5364,7 @@ elif route_page == "Settings":
         st.toggle(
             "Show paths in sidebar",
             key="show_sidebar_paths",
-            help="Shows or hides app/log paths in the left navigation.",
+            help="Shows or hides workspace labels in the left navigation without revealing local paths.",
         )
         st.number_input(
             "Console characters",
@@ -5273,7 +5560,7 @@ elif route_page == "Settings":
     with st.expander("Local Data And Licensing", expanded=False):
         st.markdown(
             f"""
-            **{PRODUCT_NAME} runs locally.** Browser sessions, run records, captures, comments, and generated assets remain on this Mac unless you configure an external provider or export them.
+            **{PRODUCT_NAME} runs locally.** Browser sessions, run records, captures, comments, and generated assets remain on this computer unless you configure an external provider or export them.
 
             Account and license integration is intentionally isolated from the automation engines. This build does not require an online Panelyra account and does not include telemetry.
             """
@@ -5413,7 +5700,7 @@ elif route_page == "Settings":
                 st.success(f"Updated {selected_ticket_id}.")
                 st.rerun()
             st.caption("Raw request log")
-            st.code(str(OWNER_REQUESTS_FILE), language="text")
+            st.code(display_path(OWNER_REQUESTS_FILE), language="text")
         else:
             render_panel(
                 "No Support Requests Yet",
@@ -5424,11 +5711,11 @@ elif route_page == "Settings":
         path_cols = st.columns(2)
         with path_cols[0]:
             st.markdown("#### Files")
-            st.code(f"App folder: {APP_DIR}", language="text")
-            st.code(f"Bot script: {BOT_PATH}", language="text")
-            st.code(f"History file: {HISTORY_FILE}", language="text")
-            st.code(f"Read marker file: {READ_MARKER_FILE}", language="text")
-            st.code(f"Research file: {RESEARCH_FILE}", language="text")
+            st.code("App folder: Panelyra workspace", language="text")
+            st.code(f"Bot script: {display_path(BOT_PATH)}", language="text")
+            st.code(f"History file: {display_path(HISTORY_FILE)}", language="text")
+            st.code(f"Read marker file: {display_path(READ_MARKER_FILE)}", language="text")
+            st.code(f"Research file: {display_path(RESEARCH_FILE)}", language="text")
         with path_cols[1]:
             st.markdown("#### Comment Styles")
             style_cols = st.columns(2)
@@ -5540,6 +5827,10 @@ elif route_page == "Help":
 render_floating_chat_widget(history_records, status_label)
 persist_workspace_drafts()
 
-if running and page in {"Dashboard", "Engage", "Capture", "Studio"}:
+should_auto_refresh = any(
+    is_process_running(runtime.get("process"))
+    for runtime in st.session_state.bot_runtimes.values()
+)
+if should_auto_refresh and route_page in {"Engage Live", "Capture Live", "Studio Live"}:
     time.sleep(int(st.session_state.auto_refresh_seconds))
     st.rerun()

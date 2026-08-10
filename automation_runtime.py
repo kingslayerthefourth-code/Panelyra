@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import fcntl
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -17,10 +20,77 @@ from urllib.parse import urlsplit
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 BROWSER_LOCK_PATH = Path(tempfile.gettempdir()) / "panelyra-browser.lock"
 ACTIVE_RUN_STATUSES = {"starting", "running"}
+MACOS_CAFFEINATE_PATH = Path("/usr/bin/caffeinate")
 
 
 class BrowserBusyError(RuntimeError):
     """Raised when another Panelyra workflow owns the shared Chrome profile."""
+
+
+class TrackedProcessRef:
+    """Minimal Popen-compatible reference restored from a durable run record."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = int(pid)
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if process_exists(self.pid):
+            return None
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while process_exists(self.pid):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)
+            time.sleep(0.05)
+        self.returncode = 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        os.kill(self.pid, signal.SIGTERM)
+
+    def kill(self) -> None:
+        os.kill(self.pid, signal.SIGKILL)
+
+
+def macos_sleep_guard_command(
+    pid: int,
+    *,
+    platform_name: str = sys.platform,
+    caffeinate_path: Path = MACOS_CAFFEINATE_PATH,
+) -> list[str] | None:
+    """Build a guard that prevents idle sleep until the target process exits."""
+    if platform_name != "darwin" or pid <= 0 or not caffeinate_path.is_file():
+        return None
+    return [
+        str(caffeinate_path),
+        "-i",
+        "-m",
+        "-u",
+        "-w",
+        str(pid),
+    ]
+
+
+def launch_macos_sleep_guard(pid: int) -> subprocess.Popen | None:
+    """Start a best-effort sleep guard without replacing the tracked bot PID."""
+    command = macos_sleep_guard_command(pid)
+    if command is None:
+        return None
+    try:
+        return subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
 
 
 def acquire_browser_lock(
@@ -186,6 +256,27 @@ def list_run_records(root: Path = RUNS_DIR, limit: int = 100) -> list[dict[str, 
         if len(records) >= limit:
             break
     return records
+
+
+def active_run_records(root: Path = RUNS_DIR) -> dict[str, dict[str, Any]]:
+    """Return the newest live run for each bot type."""
+    active: dict[str, dict[str, Any]] = {}
+    for record in list_run_records(root=root, limit=500):
+        if not isinstance(record, dict):
+            continue
+        bot_type = str(record.get("bot_type", ""))
+        try:
+            pid = int(record.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            bot_type
+            and bot_type not in active
+            and record.get("status") in ACTIVE_RUN_STATUSES
+            and process_exists(pid)
+        ):
+            active[bot_type] = record
+    return active
 
 
 def process_exists(pid: int) -> bool:

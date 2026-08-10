@@ -249,6 +249,7 @@ class ScenarioRunner:
         args: list[str],
         expect_submitted: int,
         expect_failed: int = 0,
+        expect_returncode: int = 0,
         preloaded_markers: list[dict[str, object]] | None = None,
     ) -> None:
         only_scenario = (
@@ -323,12 +324,17 @@ class ScenarioRunner:
         records = read_jsonl_records(history_file)
         submitted = [record for record in records if record.get("status") == "submitted"]
         failed = [record for record in records if record.get("status") == "failed"]
-        ok = completed.returncode == 0 and len(submitted) == expect_submitted and len(failed) == expect_failed
+        ok = (
+            completed.returncode == expect_returncode
+            and len(submitted) == expect_submitted
+            and len(failed) == expect_failed
+        )
         self.results.append(
             {
                 "name": name,
                 "ok": ok,
                 "returncode": completed.returncode,
+                "expected_returncode": expect_returncode,
                 "expected_submitted": expect_submitted,
                 "actual_submitted": len(submitted),
                 "expected_failed": expect_failed,
@@ -380,7 +386,7 @@ def main() -> int:
                 "infinite_scroll_with_thanks_success",
                 [
                     "--start-url",
-                    f"{base_url}/reader/infinite",
+                    f"{base_url}/reader/infinite?page=18",
                     "--max-chapters",
                     "2",
                     "--chapter-routing",
@@ -401,6 +407,7 @@ def main() -> int:
                 ],
                 expect_submitted=0,
                 expect_failed=1,
+                expect_returncode=1,
             )
             runner.run(
                 "paged_reader_next_control_success",

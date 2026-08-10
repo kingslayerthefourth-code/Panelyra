@@ -10,21 +10,23 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import logging
 import re
 import shutil
 import sys
+import tempfile
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.remote.webelement import WebElement
 
@@ -47,7 +49,31 @@ from reader_routing import (
 
 
 MAX_CHAPTERS = 20
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "ocr_downloads"
+CAPTURE_PERFORMANCE_PROFILES = {
+    "reliable": {"stable_rounds": 6, "max_rounds": 30, "download_workers": 4},
+    "balanced": {"stable_rounds": 3, "max_rounds": 18, "download_workers": 6},
+    "rapid": {"stable_rounds": 2, "max_rounds": 12, "download_workers": 8},
+}
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "manhwa"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_DOWNLOAD_CHROME_PROFILE = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "Google"
+    / "Chrome"
+    / "PanelyraDownloadProfile"
+)
+DOWNLOAD_DEBUG_PORT = 9223
+DOWNLOAD_BROWSER_LOCK = Path(tempfile.gettempdir()) / "panelyra-capture-browser.lock"
+LOST_DRIVER_MESSAGES = (
+    "no such window",
+    "target window already closed",
+    "web view not found",
+    "invalid session id",
+    "disconnected",
+    "chrome not reachable",
+)
 
 
 @dataclass(frozen=True)
@@ -71,7 +97,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-url", required=True, help="First chapter URL, or a series page with a detectable first chapter.")
     parser.add_argument("--max-chapters", type=int, default=1, help=f"Number of chapters to OCR. Hard capped at {MAX_CHAPTERS}.")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for OCR transcript output.")
+    parser.add_argument(
+        "--start-signal-file",
+        type=Path,
+        help="Open the reader and wait for this dashboard signal before capturing.",
+    )
+    parser.add_argument(
+        "--chrome-profile-dir",
+        type=Path,
+        default=DEFAULT_DOWNLOAD_CHROME_PROFILE,
+        help="Persistent Chrome profile used only by Capture.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for captured chapters and OCR output.")
     parser.add_argument("--content-container-selector", default=bot.CONTENT_SELECTOR, help="Container selector for chapter images.")
     parser.add_argument("--ocr-image-selector", default=bot.MANHWA_IMAGE_SELECTOR, help="Image selector for chapter pages.")
     parser.add_argument(
@@ -89,10 +126,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scroll-max-delay", type=float, default=0.18, help="Maximum delay while collecting image URLs.")
     parser.add_argument("--image-fetch-timeout", type=float, default=20.0, help="Seconds to wait for each OCR image fetch.")
     parser.add_argument(
+        "--performance-profile",
+        choices=tuple(CAPTURE_PERFORMANCE_PROFILES),
+        default="balanced",
+        help="Panel stabilization and download concurrency profile.",
+    )
+    parser.add_argument(
         "--save-images",
         action="store_true",
-        help="Also save raw chapter images locally. Use only when you have rights to archive the content.",
+        default=True,
+        help="Save raw chapter images locally (enabled by default).",
     )
+    parser.add_argument("--no-save-images", action="store_false", dest="save_images", help="Keep only the CBZ archive and OCR transcript.")
     parser.add_argument("--skip-cbz", action="store_true", help="Do not create a CBZ archive.")
     parser.add_argument("--skip-ocr", action="store_true", help="Do not create an OCR transcript.")
     return parser.parse_args()
@@ -104,6 +149,36 @@ def configure_logging() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def driver_session_lost(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return isinstance(exc, WebDriverException) and any(
+        fragment in message for fragment in LOST_DRIVER_MESSAGES
+    )
+
+
+def safe_driver_url(driver: object, fallback: str = "") -> str:
+    try:
+        return str(getattr(driver, "current_url", "") or fallback)
+    except WebDriverException:
+        return fallback
+
+
+def portable_output_path(path: Optional[Path]) -> str:
+    """Store project-owned outputs relatively so the project can be moved."""
+    if path is None:
+        return ""
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
+def local_output_path(value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def validate_args(args: argparse.Namespace) -> int:
@@ -213,6 +288,60 @@ def series_identity(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", normalized)
 
 
+SERIES_TITLE_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "by",
+    "for",
+    "from",
+    "i",
+    "im",
+    "in",
+    "is",
+    "my",
+    "of",
+    "on",
+    "read",
+    "since",
+    "the",
+    "this",
+    "to",
+    "with",
+}
+SERIES_ALIAS_MATCH_THRESHOLD = 0.60
+
+
+def series_title_tokens(value: str) -> set[str]:
+    normalized = clean_series_title(value).lower().replace("’", "'")
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    return {
+        token
+        for token in tokens
+        if len(token) >= 3 and token not in SERIES_TITLE_STOP_WORDS
+    }
+
+
+def series_alias_match_score(left: str, right: str) -> float:
+    """Return a conservative cross-site title similarity score."""
+    if series_identity(left) == series_identity(right):
+        return 1.0
+    left_tokens = series_title_tokens(left)
+    right_tokens = series_title_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    shared = left_tokens & right_tokens
+    if len(shared) < 4:
+        return 0.0
+    containment = len(shared) / min(len(left_tokens), len(right_tokens))
+    if containment < 0.64:
+        return 0.0
+    union = left_tokens | right_tokens
+    jaccard = len(shared) / len(union)
+    return (0.75 * containment) + (0.25 * jaccard)
+
+
 def read_json_payload(path: Path) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -245,10 +374,16 @@ def series_directory_candidates(directory: Path) -> list[str]:
 
 
 def directory_matches_series(directory: Path, series_title: str) -> bool:
-    target = series_identity(series_title)
-    return bool(target) and any(
-        series_identity(candidate) == target
-        for candidate in series_directory_candidates(directory)
+    return directory_series_match_score(directory, series_title) >= SERIES_ALIAS_MATCH_THRESHOLD
+
+
+def directory_series_match_score(directory: Path, series_title: str) -> float:
+    return max(
+        (
+            series_alias_match_score(candidate, series_title)
+            for candidate in series_directory_candidates(directory)
+        ),
+        default=0.0,
     )
 
 
@@ -526,6 +661,31 @@ def page_has_chapter_media(driver: object, image_selector: str) -> bool:
         return False
 
 
+def wait_for_chapter_media(
+    driver: object,
+    image_selector: str,
+    timeout_seconds: float = 30.0,
+) -> bool:
+    """Allow client-rendered readers and challenge pages time to reveal panels."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    attempt = 0
+    while time.monotonic() < deadline:
+        if page_has_chapter_media(driver, image_selector):
+            logging.info("Reader media became available after %s readiness check(s).", attempt + 1)
+            return True
+        attempt += 1
+        bot.dismiss_page_interruptions(driver, attempts=1)
+        if attempt % 3 == 0:
+            try:
+                driver.execute_script(
+                    "window.scrollTo(0, Math.max(0, document.documentElement.scrollHeight - innerHeight));"
+                )
+            except WebDriverException:
+                pass
+        time.sleep(0.5)
+    return page_has_chapter_media(driver, image_selector)
+
+
 def maybe_open_capture_chapter(driver: object, current_url: str, image_selector: str) -> str:
     """Stay on a reader page even when it has no comment form."""
     if page_has_chapter_media(driver, image_selector):
@@ -661,7 +821,28 @@ def collect_story_image_urls(
     *,
     segment_min_y: int = 0,
     segment_max_y: Optional[int] = None,
+    stable_rounds_required: int = 3,
+    stability_max_rounds: int = 18,
+    expected_image_count: int = 0,
 ) -> list[str]:
+    initial_urls = [
+        url
+        for url in visible_story_image_urls(
+            driver,
+            image_selector,
+            min_y=segment_min_y,
+            max_y=segment_max_y,
+        )
+        if not is_promotional_asset_url(url)
+    ]
+    if expected_image_count > 0 and len(initial_urls) >= expected_image_count:
+        driver.execute_script("window.scrollTo(0, arguments[0]);", max(0, int(segment_min_y)))
+        logging.info(
+            "Reader already exposes all %s expected panel URL(s); skipping redundant scan scrolling.",
+            expected_image_count,
+        )
+        return list(dict.fromkeys(initial_urls))
+
     height = max(bot.document_height(driver), 1)
     viewport = max(bot.viewport_height(driver), 600)
     step = max(350, int(viewport * 0.72))
@@ -669,12 +850,13 @@ def collect_story_image_urls(
     seen: set[str] = set()
     y = max(0, int(segment_min_y))
     stagnant_rounds = 0
-    for _ in range(800):
+    for scroll_round in range(800):
         if y > height:
             break
         driver.execute_script("window.scrollTo(0, arguments[0]);", y)
         time.sleep(max(0.04, min(max_delay, 0.25)))
-        bot.dismiss_page_interruptions(driver, attempts=2)
+        if scroll_round % 12 == 0:
+            bot.dismiss_page_interruptions(driver, attempts=1)
         for url in visible_story_image_urls(
             driver,
             image_selector,
@@ -695,8 +877,106 @@ def collect_story_image_urls(
         if stagnant_rounds >= 8 and y >= max(0, height - viewport):
             break
         y += step
+    urls = stabilize_story_image_urls(
+        driver,
+        image_selector,
+        min_delay,
+        max_delay,
+        urls,
+        segment_min_y=segment_min_y,
+        segment_max_y=segment_max_y,
+        stable_rounds_required=stable_rounds_required,
+        max_rounds=stability_max_rounds,
+    )
+    final_dom_order = [
+        url
+        for url in visible_story_image_urls(
+            driver,
+            image_selector,
+            min_y=segment_min_y,
+            max_y=segment_max_y,
+        )
+        if not is_promotional_asset_url(url)
+    ]
+    if final_dom_order:
+        ordered_seen = set(final_dom_order)
+        urls = final_dom_order + [url for url in urls if url not in ordered_seen]
     driver.execute_script("window.scrollTo(0, arguments[0]);", max(0, int(segment_min_y)))
     logging.info("Detected %s story-region image(s); site chrome and comment media were excluded.", len(urls))
+    return urls
+
+
+def stabilize_story_image_urls(
+    driver: object,
+    image_selector: str,
+    min_delay: float,
+    max_delay: float,
+    collected_urls: list[str],
+    *,
+    segment_min_y: int = 0,
+    segment_max_y: Optional[int] = None,
+    stable_rounds_required: int = 6,
+    max_rounds: int = 30,
+) -> list[str]:
+    """Wait at the chapter end until lazy-loaded panel URLs stop changing."""
+    urls = list(collected_urls)
+    seen = set(urls)
+    previous_signature: tuple[int, tuple[str, ...]] | None = None
+    stable_rounds = 0
+
+    for _ in range(max_rounds):
+        viewport = max(bot.viewport_height(driver), 600)
+        document_end = max(bot.document_height(driver), 1)
+        chapter_end = (
+            min(document_end, int(segment_max_y))
+            if segment_max_y is not None
+            else document_end
+        )
+        for target in (
+            max(int(segment_min_y), chapter_end - max(200, viewport // 2)),
+            max(int(segment_min_y), chapter_end - 1),
+        ):
+            driver.execute_script("window.scrollTo(0, arguments[0]);", target)
+            time.sleep(max(0.08, min(max_delay, 0.35)))
+        bot.dismiss_page_interruptions(driver, attempts=1)
+
+        detected = [
+            url
+            for url in visible_story_image_urls(
+                driver,
+                image_selector,
+                min_y=segment_min_y,
+                max_y=segment_max_y,
+            )
+            if not is_promotional_asset_url(url)
+        ]
+        added = 0
+        for url in detected:
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+                added += 1
+
+        signature = (max(bot.document_height(driver), 1), tuple(detected))
+        stable_rounds = (
+            stable_rounds + 1
+            if added == 0 and signature == previous_signature
+            else 0
+        )
+        previous_signature = signature
+        if stable_rounds >= stable_rounds_required:
+            logging.info(
+                "Chapter end stabilized with %s panel URL(s) after %s unchanged checks.",
+                len(urls),
+                stable_rounds_required,
+            )
+            break
+    else:
+        logging.warning(
+            "Chapter end did not fully stabilize after %s checks; using %s panel URL(s).",
+            max_rounds,
+            len(urls),
+        )
     return urls
 
 
@@ -815,6 +1095,8 @@ def collect_chapter_image_urls(
     chapter_list_selector: str = DEFAULT_CHAPTER_LIST_SELECTOR,
     segment_min_y: int = 0,
     segment_max_y: Optional[int] = None,
+    stable_rounds_required: int = 3,
+    stability_max_rounds: int = 18,
 ) -> list[str]:
     selectors = ReaderSelectors(
         next_chapter=next_chapter_selector,
@@ -824,7 +1106,7 @@ def collect_chapter_image_urls(
         chapter_list=chapter_list_selector,
     )
     first_snapshot = reader_snapshot(driver, selectors)
-    detected_layout = classify_reader_layout(first_snapshot, reader_layout)
+    detected_layout = capture_reader_layout(first_snapshot, reader_layout)
     logging.info(
         "Capture reader layout: %s (page %s/%s).",
         detected_layout,
@@ -832,6 +1114,12 @@ def collect_chapter_image_urls(
         first_snapshot.page_total or "?",
     )
     if detected_layout not in {"paginated", "mixed"}:
+        expected_image_count = (
+            first_snapshot.page_total
+            if first_snapshot.page_total > 1
+            and first_snapshot.image_count >= first_snapshot.page_total
+            else 0
+        )
         return collect_story_image_urls(
             driver,
             image_selector,
@@ -839,13 +1127,23 @@ def collect_chapter_image_urls(
             max_delay,
             segment_min_y=segment_min_y,
             segment_max_y=segment_max_y,
+            stable_rounds_required=stable_rounds_required,
+            stability_max_rounds=stability_max_rounds,
+            expected_image_count=expected_image_count,
         )
 
     all_urls: list[str] = []
     seen: set[str] = set()
     seen_states: set[tuple[str, int, str]] = set()
     for page_attempt in range(1, 201):
-        for url in collect_story_image_urls(driver, image_selector, min_delay, max_delay):
+        for url in collect_story_image_urls(
+            driver,
+            image_selector,
+            min_delay,
+            max_delay,
+            stable_rounds_required=stable_rounds_required,
+            stability_max_rounds=stability_max_rounds,
+        ):
             if url not in seen:
                 seen.add(url)
                 all_urls.append(url)
@@ -881,6 +1179,34 @@ def collect_chapter_image_urls(
         if advance_reader_page(driver, selectors) is None:
             break
     return all_urls
+
+
+def capture_reader_layout(snapshot: object, preferred: str) -> str:
+    """Let a concrete multi-page counter override stale next-chapter settings."""
+    detected = classify_reader_layout(snapshot, preferred)
+    page_total = int(getattr(snapshot, "page_total", 0) or 0)
+    image_count = int(getattr(snapshot, "image_count", 0) or 0)
+    all_pages_already_present = page_total > 1 and image_count >= page_total
+    if (
+        page_total > 1
+        and not all_pages_already_present
+        and detected not in {"paginated", "mixed"}
+    ):
+        corrected = "mixed" if bool(getattr(snapshot, "has_next_chapter", False)) else "paginated"
+        logging.info(
+            "Reader page counter reports %s pages; overriding Capture layout %s -> %s.",
+            page_total,
+            detected,
+            corrected,
+        )
+        return corrected
+    if all_pages_already_present:
+        logging.info(
+            "Reader exposes all %s panels in the current DOM; keeping vertical chapter routing.",
+            page_total,
+        )
+        return "next-chapter" if bool(getattr(snapshot, "has_next_chapter", False)) else "continuous"
+    return detected
 
 
 def request_headers(driver: object) -> dict[str, str]:
@@ -921,19 +1247,102 @@ def image_extension_from_payload(url: str, payload: bytes) -> str:
     return extension_from_url(url)
 
 
+def normalize_panel_url_order(urls: list[str]) -> list[str]:
+    """Use explicit sequential source filenames when lazy loading shuffled the DOM."""
+    numbered: list[tuple[int, int, str]] = []
+    for position, url in enumerate(urls):
+        match = re.match(r"^(\d{1,5})[_-]", Path(urlparse(url).path).name)
+        if not match:
+            return urls
+        numbered.append((int(match.group(1)), position, url))
+    page_numbers = [number for number, _, _ in numbered]
+    if len(set(page_numbers)) != len(urls) or set(page_numbers) != set(
+        range(1, len(urls) + 1)
+    ):
+        return urls
+    ordered = [url for _, _, url in sorted(numbered)]
+    if ordered != urls:
+        logging.info("Reordered %s chapter pages using sequential source filenames.", len(urls))
+    return ordered
+
+
+def maximum_quality_image_url(url: str) -> str:
+    """Remove common CDN resize/transcode controls while preserving auth parameters."""
+    if not url.startswith(("http://", "https://")):
+        return url
+    parts = urlsplit(url)
+    query = parse_qs(parts.query, keep_blank_values=True)
+    transform_keys = {
+        "width",
+        "height",
+        "w",
+        "h",
+        "quality",
+        "q",
+        "resize",
+        "fit",
+        "format",
+        "type",
+    }
+    filtered = {
+        key: values
+        for key, values in query.items()
+        if key.lower() not in transform_keys
+    }
+    if filtered == query:
+        return url
+    flattened = [
+        (key, value)
+        for key, values in filtered.items()
+        for value in values
+    ]
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(flattened), parts.fragment)
+    )
+
+
+def missing_sequential_panel_numbers(urls: list[str]) -> list[int]:
+    """Report gaps when every source URL exposes a one-based panel number."""
+    numbers: list[int] = []
+    for url in urls:
+        match = re.match(r"^(\d{1,5})[_-]", Path(urlparse(url).path).name)
+        if not match:
+            return []
+        numbers.append(int(match.group(1)))
+    if not numbers or min(numbers) != 1:
+        return []
+    return sorted(set(range(1, max(numbers) + 1)) - set(numbers))
+
+
 def is_image_payload(payload: bytes) -> bool:
     return image_extension_from_payload("", payload) != ".jpg" or payload.startswith(b"\xff\xd8\xff")
 
 
 def _download_image(item: tuple[int, str], headers: dict[str, str], timeout_seconds: float) -> tuple[int, str, bytes]:
     index, url = item
-    response = requests.get(url, timeout=timeout_seconds, headers=headers)
-    response.raise_for_status()
-    content_type = response.headers.get("Content-Type", "").lower()
-    payload = response.content
-    if len(payload) < 512 or (not content_type.startswith("image/") and not is_image_payload(payload)):
-        raise ValueError(f"Invalid image response ({content_type or 'unknown'}, {len(payload)} bytes)")
-    return index, url, payload
+    preferred_url = maximum_quality_image_url(url)
+    candidates = [preferred_url] if preferred_url == url else [preferred_url, url]
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            response = _download_session().get(candidate, timeout=timeout_seconds, headers=headers)
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            payload = response.content
+            if len(payload) < 512 or (
+                not content_type.startswith("image/") and not is_image_payload(payload)
+            ):
+                raise ValueError(
+                    f"Invalid image response ({content_type or 'unknown'}, {len(payload)} bytes)"
+                )
+            if candidate != url:
+                logging.info("Downloaded maximum-quality panel source: %s", candidate)
+            return index, candidate, payload
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError(f"No image download candidate was available for {url}")
 
 
 def save_rendered_image_fallback(driver: object, url: str, target: Path) -> bool:
@@ -1009,12 +1418,31 @@ def fetch_image_through_browser(driver: object, url: str) -> bytes:
         return b""
 
 
-def save_images(driver: object, urls: list[str], output_dir: Path, timeout_seconds: float) -> int:
+_DOWNLOAD_SESSION_STATE = threading.local()
+
+
+def _download_session() -> requests.Session:
+    session = getattr(_DOWNLOAD_SESSION_STATE, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=1)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _DOWNLOAD_SESSION_STATE.session = session
+    return session
+
+
+def save_images(
+    driver: object,
+    urls: list[str],
+    output_dir: Path,
+    timeout_seconds: float,
+    download_workers: int = 6,
+) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     headers = request_headers(driver)
     saved = 0
-    seen_hashes: set[str] = set()
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(urls)))) as executor:
+    with ThreadPoolExecutor(max_workers=min(max(1, download_workers), max(1, len(urls)))) as executor:
         futures = [
             executor.submit(_download_image, item, headers, timeout_seconds)
             for item in enumerate(urls, start=1)
@@ -1023,11 +1451,6 @@ def save_images(driver: object, urls: list[str], output_dir: Path, timeout_secon
         url = source_url
         try:
             index, url, payload = future.result()
-            digest = hashlib.sha256(payload).hexdigest()
-            if digest in seen_hashes:
-                logging.info("Skipped duplicate image: %s", url)
-                continue
-            seen_hashes.add(digest)
             target = output_dir / f"{index:03d}{image_extension_from_payload(url, payload)}"
             target.write_bytes(payload)
         except (requests.RequestException, ValueError) as exc:
@@ -1049,18 +1472,45 @@ def save_images(driver: object, urls: list[str], output_dir: Path, timeout_secon
     return saved
 
 
+def ordered_archive_images(images_dir: Path) -> list[Path]:
+    allowed = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+    def page_key(path: Path) -> tuple[int, str]:
+        match = re.search(r"\d+", path.stem)
+        return (int(match.group()) if match else sys.maxsize, path.name.lower())
+
+    return sorted(
+        (
+            path
+            for path in images_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in allowed
+        ),
+        key=page_key,
+    )
+
+
 def create_chapter_archive(images_dir: Path, chapter_dir: Path) -> Path:
     archive = chapter_dir / "chapter-pages.cbz"
-    image_files = sorted(
-        path
-        for path in images_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-    )
+    image_files = ordered_archive_images(images_dir)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as output:
         for image_path in image_files:
             output.write(image_path, arcname=image_path.name)
     logging.info("Chapter image archive written: %s (%s page files).", archive, len(image_files))
     return archive
+
+
+def extract_saved_images_ocr(images_dir: Path, confidence: float) -> str:
+    """OCR the exact archived panel bytes without another network request."""
+    return extract_chapter_content(
+        None,
+        "body",
+        {
+            "mode": "manhwa",
+            "img_selector": "img",
+            "confidence": confidence,
+            "image_files": [str(path) for path in ordered_archive_images(images_dir)],
+        },
+    )
 
 
 def chapter_number_from_text(value: str) -> Optional[float]:
@@ -1071,6 +1521,25 @@ def chapter_number_from_text(value: str) -> Optional[float]:
         return float(matches[-1])
     except ValueError:
         return None
+
+
+def next_numbered_chapter_url(url: str) -> Optional[str]:
+    """Advance common chapter URL suffixes only when no site control is available."""
+    parsed = urlsplit(url)
+    match = re.search(
+        r"(?<![A-Za-z0-9])(?P<token>chapter|chap|ch|episode|ep)(?P<separator>[-_ /]*)(?P<number>\d+)(?P<trailing>/?)$",
+        parsed.path,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    number_start, number_end = match.span("number")
+    next_path = (
+        parsed.path[:number_start]
+        + str(int(match.group("number")) + 1)
+        + parsed.path[number_end:]
+    )
+    return urlunsplit((parsed.scheme, parsed.netloc, next_path, parsed.query, parsed.fragment))
 
 
 def next_chapter_from_series(driver: object, chapter_url: str, chapter_title_text: str) -> Optional[str]:
@@ -1145,7 +1614,14 @@ def resolve_next_chapter_url(
         logging.info("Visible chapter list resolved next chapter: %s", list_url)
         return list_url
     logging.info("No direct next-chapter link found; checking the series chapter list.")
-    return next_chapter_from_series(driver, chapter_url, chapter_title_text)
+    series_url = next_chapter_from_series(driver, chapter_url, chapter_title_text)
+    if series_url:
+        return series_url
+    fallback_url = next_numbered_chapter_url(chapter_url)
+    if fallback_url and canonical_chapter_url(fallback_url) != canonical_chapter_url(chapter_url):
+        logging.info("Using numbered chapter URL fallback: %s", fallback_url)
+        return fallback_url
+    return None
 
 
 def ocr_current_chapter(
@@ -1171,6 +1647,10 @@ def ocr_current_chapter(
     chapter_list_selector: str,
     segment_min_y: int = 0,
     segment_max_y: Optional[int] = None,
+    reporter: object | None = None,
+    stable_rounds_required: int = 3,
+    stability_max_rounds: int = 18,
+    download_workers: int = 6,
 ) -> ChapterDownload:
     chapter_source_url = bot.canonical_chapter_key(getattr(driver, "current_url", ""))
     if segment_min_y > 0:
@@ -1183,6 +1663,11 @@ def ocr_current_chapter(
     )
     chapter_dir.mkdir(parents=True, exist_ok=True)
 
+    if not wait_for_chapter_media(driver, image_selector):
+        logging.warning(
+            "Reader media was still unavailable after the readiness window; "
+            "running final detection before failing."
+        )
     image_urls = collect_chapter_image_urls(
         driver,
         image_selector,
@@ -1195,54 +1680,93 @@ def ocr_current_chapter(
         chapter_list_selector=chapter_list_selector,
         segment_min_y=segment_min_y,
         segment_max_y=segment_max_y,
+        stable_rounds_required=stable_rounds_required,
+        stability_max_rounds=stability_max_rounds,
     )
+    image_urls = normalize_panel_url_order(image_urls)
     if not image_urls:
         raise RuntimeError(
             "No chapter page media was detected. Select a different reader layout or set the chapter image selector in Advanced configuration."
         )
+    missing_panels = missing_sequential_panel_numbers(image_urls)
+    if missing_panels:
+        missing_text = ", ".join(str(number) for number in missing_panels[:12])
+        raise RuntimeError(
+            "Chapter capture is incomplete; numbered panel URL(s) are missing: "
+            f"{missing_text}. The chapter was not finalized."
+        )
     image_urls_file = chapter_dir / "image_urls.txt"
     image_urls_file.write_text("\n".join(image_urls) + ("\n" if image_urls else ""), encoding="utf-8")
 
-    text = ""
-    text_file: Optional[Path] = None
-    if save_ocr:
-        text = extract_chapter_content(
-            driver,
-            container_selector,
-            {
-                "mode": "manhwa",
-                "img_selector": image_selector,
-                "confidence": confidence,
-                "timeout_seconds": image_fetch_timeout,
-                "image_urls": image_urls,
-            },
-        )
-        text_file = chapter_dir / "ocr.txt"
-        text_file.write_text(text.rstrip() + "\n", encoding="utf-8")
-
+    # Save pages before OCR so a slow OCR run cannot hide an otherwise complete capture.
     images_dir = chapter_dir / "images"
     archive_file: Optional[Path] = None
     saved = 0
     if save_raw_images or create_archive:
-        saved = save_images(driver, image_urls, images_dir, image_fetch_timeout)
-        logging.info("Saved %s/%s raw image(s) for chapter %s.", saved, len(image_urls), chapter_index)
-        if saved and create_archive:
+        if reporter:
+            reporter.update(
+                stage="saving-images",
+                message=f"Saving chapter {chapter_index} images before OCR",
+            )
+        saved = save_images(
+            driver,
+            image_urls,
+            images_dir,
+            image_fetch_timeout,
+            download_workers=download_workers,
+        )
+        logging.info(
+            "Saved %s/%s raw image(s) for chapter %s before OCR.",
+            saved,
+            len(image_urls),
+            chapter_index,
+        )
+        if saved != len(image_urls):
+            raise RuntimeError(
+                f"Chapter image download is incomplete: saved {saved}/{len(image_urls)} panels. "
+                "The chapter was not finalized."
+            )
+        if create_archive:
             archive_file = create_chapter_archive(images_dir, chapter_dir)
-        if saved and not save_raw_images:
-            shutil.rmtree(images_dir)
+
+    text = ""
+    text_file: Optional[Path] = None
+    if save_ocr:
+        if reporter:
+            reporter.update(
+                stage="ocr",
+                message=f"Reading text from chapter {chapter_index}",
+            )
+        saved_image_files = ordered_archive_images(images_dir) if images_dir.is_dir() else []
+        ocr_settings: dict[str, object] = {
+            "mode": "manhwa",
+            "img_selector": image_selector,
+            "confidence": confidence,
+            "timeout_seconds": image_fetch_timeout,
+        }
+        if saved_image_files:
+            ocr_settings["image_files"] = [str(path) for path in saved_image_files]
+        else:
+            ocr_settings["image_urls"] = image_urls
+        text = extract_chapter_content(driver, container_selector, ocr_settings)
+        text_file = chapter_dir / "ocr.txt"
+        text_file.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+    if saved and not save_raw_images:
+        shutil.rmtree(images_dir)
 
     metadata = {
         "index": chapter_index,
         "series_title": series_title,
         "series_slug": series_slug,
-        "series_dir": str(output_dir),
+        "series_dir": portable_output_path(output_dir),
         "chapter_folder": chapter_dir.name,
         "url": chapter_source_url,
         "title": title,
         "image_count": len(image_urls),
         "saved_image_count": saved,
-        "images_dir": str(images_dir) if saved and save_raw_images else "",
-        "archive_file": str(archive_file) if archive_file else "",
+        "images_dir": portable_output_path(images_dir) if saved and save_raw_images else "",
+        "archive_file": portable_output_path(archive_file),
         "character_count": len(text),
         "saved_at_epoch": int(time.time()),
         "reader_layout": reader_layout,
@@ -1255,20 +1779,38 @@ def ocr_current_chapter(
         index=chapter_index,
         url=str(metadata["url"]),
         title=title,
-        text_file=str(text_file) if text_file else "",
-        image_urls_file=str(image_urls_file),
+        text_file=portable_output_path(text_file),
+        image_urls_file=portable_output_path(image_urls_file),
         image_count=len(image_urls),
         character_count=len(text),
         status="ok",
-        images_dir=str(images_dir) if saved and save_raw_images else "",
-        archive_file=str(archive_file) if archive_file else "",
+        images_dir=portable_output_path(images_dir) if saved and save_raw_images else "",
+        archive_file=portable_output_path(archive_file),
     )
+
+
+def open_capture_driver(
+    chrome_profile_dir: Path,
+    url: str,
+    label: str,
+) -> bot.DriverSession:
+    session = bot.build_driver(
+        chrome_profile_dir=chrome_profile_dir,
+        remote_debugging_port=DOWNLOAD_DEBUG_PORT,
+        browser_lock_path=DOWNLOAD_BROWSER_LOCK,
+    )
+    if bot.load_url_with_retries(session.driver, url, label):
+        return session
+    bot.close_driver_session(session)
+    raise TimeoutException(f"Could not load URL: {url}")
 
 
 def download_manhwa_ocr(
     *,
     start_url: str,
     max_chapters: int,
+    start_signal_file: Optional[Path] = None,
+    chrome_profile_dir: Path = DEFAULT_DOWNLOAD_CHROME_PROFILE,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     container_selector: str = bot.CONTENT_SELECTOR,
     image_selector: str = bot.MANHWA_IMAGE_SELECTOR,
@@ -1276,7 +1818,7 @@ def download_manhwa_ocr(
     scroll_min_delay: float = 0.08,
     scroll_max_delay: float = 0.18,
     image_fetch_timeout: float = 20.0,
-    save_raw_images: bool = False,
+    save_raw_images: bool = True,
     create_archive: bool = True,
     save_ocr: bool = True,
     reader_layout: str = "auto",
@@ -1284,10 +1826,20 @@ def download_manhwa_ocr(
     next_page_selector: str = DEFAULT_NEXT_PAGE_SELECTOR,
     page_counter_selector: str = DEFAULT_PAGE_COUNTER_SELECTOR,
     chapter_list_selector: str = DEFAULT_CHAPTER_LIST_SELECTOR,
+    performance_profile: str = "balanced",
 ) -> list[ChapterDownload]:
     start_url = normalize_web_url(start_url)
     if max_chapters < 1 or max_chapters > MAX_CHAPTERS:
         raise ValueError(f"max_chapters must be between 1 and {MAX_CHAPTERS}.")
+    profile = CAPTURE_PERFORMANCE_PROFILES.get(performance_profile)
+    if profile is None:
+        raise ValueError(f"Unknown performance profile: {performance_profile}")
+    logging.info(
+        "Capture performance profile: %s (%s stable checks, %s download workers).",
+        performance_profile,
+        profile["stable_rounds"],
+        profile["download_workers"],
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     driver_session: Optional[bot.DriverSession] = None
@@ -1297,14 +1849,86 @@ def download_manhwa_ocr(
     manifest: Optional[Path] = None
     manifest_records: list[dict[str, object]] = []
     completed_urls: set[str] = set()
+    defer_ocr = bool(save_ocr and save_raw_images and max_chapters > 1)
+    ocr_executor = ThreadPoolExecutor(max_workers=1) if defer_ocr else None
+    pending_ocr: list[tuple[int, object, Path]] = []
 
     try:
         if reporter:
             reporter.update(status="running", stage="opening-browser", progress_total=max_chapters)
-        driver_session = bot.build_driver()
+        driver_session = open_capture_driver(
+            chrome_profile_dir,
+            start_url,
+            "OCR start page",
+        )
         driver = driver_session.driver
-        if not bot.load_url_with_retries(driver, start_url, "OCR start page"):
-            raise TimeoutException(f"Could not load start URL: {start_url}")
+
+        if start_signal_file is not None:
+            start_signal_file.unlink(missing_ok=True)
+            logging.info(
+                "Browser review is active. Confirm authentication and the target reader, "
+                "then select Begin Capture in Panelyra."
+            )
+            if reporter:
+                reporter.update(
+                    status="running",
+                    stage="waiting-for-user",
+                    message=(
+                        "Browser review required. Confirm the target reader, "
+                        "then select Begin Capture."
+                    ),
+                )
+            while not start_signal_file.exists():
+                try:
+                    if not driver.window_handles:
+                        raise WebDriverException("Capture Chrome has no open windows.")
+                    driver.current_url
+                except WebDriverException:
+                    logging.warning(
+                        "Capture Chrome was closed during inspection; reopening it "
+                        "with the persistent download profile."
+                    )
+                    bot.close_driver_session(driver_session)
+                    driver_session = open_capture_driver(
+                        chrome_profile_dir,
+                        start_url,
+                        "inspection browser recovery",
+                    )
+                    driver = driver_session.driver
+                    if reporter:
+                        reporter.update(
+                            status="running",
+                            stage="waiting-for-user",
+                            message=(
+                                "The Capture browser was restored. Confirm the target reader, "
+                                "then select Begin Capture."
+                            ),
+                        )
+                time.sleep(0.5)
+            try:
+                inspected_url = str(driver.current_url or "").strip()
+            except WebDriverException:
+                inspected_url = ""
+            if not inspected_url.startswith(("http://", "https://")):
+                logging.warning(
+                    "The Capture browser was unavailable when Begin Capture was selected; "
+                    "reopening the configured start URL."
+                )
+                bot.close_driver_session(driver_session)
+                driver_session = open_capture_driver(
+                    chrome_profile_dir,
+                    start_url,
+                    "continue browser recovery",
+                )
+                driver = driver_session.driver
+                inspected_url = str(driver.current_url)
+            logging.info(
+                "Capture start signal received. Continuing from current browser page: %s",
+                inspected_url,
+            )
+            start_signal_file.unlink(missing_ok=True)
+            start_url = inspected_url
+            current_url = inspected_url
 
         bot.dismiss_page_interruptions(driver)
         current_url = maybe_open_capture_chapter(driver, driver.current_url, image_selector)
@@ -1332,18 +1956,25 @@ def download_manhwa_ocr(
         segment_min_y = 0
         for chapter_index in range(1, max_chapters + 1):
             effective_layout = reader_layout if reader_layout != "auto" else "next-chapter"
-            logging.info("OCR downloading chapter %s/%s: %s", chapter_index, max_chapters, driver.current_url)
+            logging.info(
+                "OCR downloading chapter %s/%s: %s",
+                chapter_index,
+                max_chapters,
+                safe_driver_url(driver, current_url or start_url),
+            )
             if reporter:
                 reporter.checkpoint(
                     "scanning",
                     chapter_index=chapter_index,
-                    url=driver.current_url,
+                    url=safe_driver_url(driver, current_url or start_url),
                     message=f"Scanning chapter {chapter_index}/{max_chapters}",
                 )
+            processed_chapter_url = current_url or start_url
+            processed_chapter_title = f"chapter-{chapter_index:02d}"
             try:
                 processed_chapter_url = driver.current_url
                 processed_chapter_title = chapter_title(driver, chapter_index)
-                effective_layout = classify_reader_layout(
+                effective_layout = capture_reader_layout(
                     reader_snapshot(
                         driver,
                         ReaderSelectors(
@@ -1356,6 +1987,12 @@ def download_manhwa_ocr(
                     ),
                     reader_layout,
                 )
+                if reader_layout == "auto" and next_numbered_chapter_url(processed_chapter_url):
+                    if effective_layout == "continuous":
+                        logging.info(
+                            "Numbered chapter URL detected; using next-chapter routing instead of continuous-boundary scanning."
+                        )
+                        effective_layout = "next-chapter"
                 if (
                     effective_layout != "continuous"
                     and bot.canonical_chapter_key(driver.current_url) in completed_urls
@@ -1376,15 +2013,29 @@ def download_manhwa_ocr(
                         image_fetch_timeout=image_fetch_timeout,
                         save_raw_images=save_raw_images,
                         create_archive=create_archive,
-                        save_ocr=save_ocr,
+                        save_ocr=save_ocr and not defer_ocr,
                         reader_layout=reader_layout,
                         next_chapter_selector=next_chapter_selector,
                         next_page_selector=next_page_selector,
                         page_counter_selector=page_counter_selector,
                         chapter_list_selector=chapter_list_selector,
                         segment_min_y=segment_min_y,
+                        reporter=reporter,
+                        stable_rounds_required=int(profile["stable_rounds"]),
+                        stability_max_rounds=int(profile["max_rounds"]),
+                        download_workers=int(profile["download_workers"]),
                     )
                     results.append(result)
+                    if defer_ocr and ocr_executor is not None and result.images_dir:
+                        images_path = local_output_path(result.images_dir)
+                        pending_ocr.append(
+                            (
+                                len(results) - 1,
+                                ocr_executor.submit(extract_saved_images_ocr, images_path, confidence),
+                                images_path.parent,
+                            )
+                        )
+                        logging.info("Queued chapter %s for deferred local OCR.", chapter_index)
                     result_record = asdict(result)
                     result_key = capture_result_key(result.url)
                     manifest_records = [
@@ -1401,7 +2052,7 @@ def download_manhwa_ocr(
                 results.append(
                     ChapterDownload(
                         index=chapter_index,
-                        url=getattr(driver, "current_url", current_url or ""),
+                        url=safe_driver_url(driver, processed_chapter_url),
                         title=f"chapter-{chapter_index:02d}",
                         text_file="",
                         image_urls_file="",
@@ -1413,6 +2064,24 @@ def download_manhwa_ocr(
                 )
                 if reporter:
                     reporter.update(message=f"Chapter {chapter_index} failed: {exc}")
+                if driver_session_lost(exc):
+                    recovery_url = processed_chapter_url or current_url or start_url
+                    logging.warning(
+                        "Controlled Chrome window was lost; restarting it at %s.",
+                        recovery_url,
+                    )
+                    bot.close_driver_session(driver_session)
+                    driver_session = open_capture_driver(
+                        chrome_profile_dir,
+                        recovery_url,
+                        f"OCR recovery after chapter {chapter_index}",
+                    )
+                    driver = driver_session.driver
+                    bot.dismiss_page_interruptions(driver)
+                    current_url = driver.current_url
+                    segment_min_y = 0
+                    logging.info("Browser recovery succeeded; continuing the Capture run.")
+                    continue
 
             if chapter_index >= max_chapters:
                 break
@@ -1454,10 +2123,43 @@ def download_manhwa_ocr(
             ):
                 break
 
+        if pending_ocr:
+            if driver_session is not None:
+                bot.close_driver_session(driver_session)
+                driver_session = None
+            if reporter:
+                reporter.update(stage="ocr", message=f"Finalizing OCR for {len(pending_ocr)} captured chapter(s)")
+            for position, (result_index, future, chapter_dir) in enumerate(pending_ocr, start=1):
+                try:
+                    text = future.result()
+                    text_file = chapter_dir / "ocr.txt"
+                    text_file.write_text(text.rstrip() + "\n", encoding="utf-8")
+                    metadata_file = chapter_dir / "metadata.json"
+                    metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+                    metadata["character_count"] = len(text)
+                    metadata["ocr_status"] = "completed"
+                    metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                    results[result_index] = replace(
+                        results[result_index],
+                        text_file=portable_output_path(text_file),
+                        character_count=len(text),
+                    )
+                    logging.info("Deferred OCR completed for chapter %s/%s.", position, len(pending_ocr))
+                except Exception as exc:
+                    logging.exception("Deferred OCR failed for %s: %s", chapter_dir.name, exc)
+                    metadata_file = chapter_dir / "metadata.json"
+                    try:
+                        metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+                        metadata["ocr_status"] = "failed"
+                        metadata["ocr_error"] = str(exc)
+                        metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                    except (OSError, json.JSONDecodeError):
+                        pass
+            ocr_executor.shutdown(wait=True)
+            ocr_executor = None
+
         if manifest is not None:
             for result in results:
-                if result.status == "ok":
-                    continue
                 result_record = asdict(result)
                 result_key = capture_result_key(result.url)
                 manifest_records = [
@@ -1468,7 +2170,17 @@ def download_manhwa_ocr(
                 manifest_records.append(result_record)
             atomic_write_json(manifest, manifest_records)
             logging.info("OCR download manifest written: %s", manifest)
-        if reporter:
+        failed_results = [result for result in results if result.status != "ok"]
+        if reporter and failed_results:
+            failure_reason = failed_results[-1].error or "One or more chapters failed."
+            reporter.update(
+                status="failed",
+                stage="failed",
+                progress_current=len([result for result in results if result.status == "ok"]),
+                stop_reason=failure_reason,
+                message=failure_reason,
+            )
+        elif reporter:
             reporter.update(status="completed", stage="completed", progress_current=len(results))
         return results
     except Exception as exc:
@@ -1476,6 +2188,8 @@ def download_manhwa_ocr(
             reporter.update(status="failed", stage="failed", stop_reason=str(exc))
         raise
     finally:
+        if ocr_executor is not None:
+            ocr_executor.shutdown(wait=False, cancel_futures=True)
         if driver_session is not None:
             bot.close_driver_session(driver_session)
 
@@ -1491,6 +2205,8 @@ def main() -> int:
         results = download_manhwa_ocr(
             start_url=args.start_url,
             max_chapters=args.max_chapters,
+            start_signal_file=args.start_signal_file,
+            chrome_profile_dir=args.chrome_profile_dir,
             output_dir=args.output_dir,
             container_selector=args.content_container_selector,
             image_selector=args.ocr_image_selector,
@@ -1506,13 +2222,16 @@ def main() -> int:
             next_page_selector=args.next_page_selector,
             page_counter_selector=args.page_counter_selector,
             chapter_list_selector=args.chapter_list_selector,
+            performance_profile=args.performance_profile,
         )
     except Exception as exc:
         logging.exception("Comic OCR downloader failed: %s", exc)
         return 1
 
-    logging.info("Finished. Chapters written: %s.", len([result for result in results if result.status == "ok"]))
-    return 0
+    written = len([result for result in results if result.status == "ok"])
+    failed = len(results) - written
+    logging.info("Finished. Chapters written: %s. Failed: %s.", written, failed)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

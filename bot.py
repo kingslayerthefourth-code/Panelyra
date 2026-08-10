@@ -834,8 +834,18 @@ def start_chrome_driver(options: Options) -> WebDriver:
     return webdriver.Chrome(service=service, options=options)
 
 
-def build_driver(*, headless: bool = False, chrome_profile_dir: Optional[Path] = None) -> DriverSession:
-    browser_lock = acquire_browser_lock("Panelyra Engage or Capture")
+def build_driver(
+    *,
+    headless: bool = False,
+    chrome_profile_dir: Optional[Path] = None,
+    remote_debugging_port: int = CHROME_DEBUG_PORT,
+    browser_lock_path: Optional[Path] = None,
+) -> DriverSession:
+    browser_lock = (
+        acquire_browser_lock("Panelyra Engage or Capture", browser_lock_path)
+        if browser_lock_path is not None
+        else acquire_browser_lock("Panelyra Engage or Capture")
+    )
     profile_path = str(chrome_profile_dir) if chrome_profile_dir else chrome_profile_path()
     logging.info("Using Chrome automation profile: %s", profile_path)
 
@@ -862,7 +872,7 @@ def build_driver(*, headless: bool = False, chrome_profile_dir: Optional[Path] =
                 options.add_argument("--headless=new")
                 options.add_argument("--window-size=1440,1800")
             else:
-                options.add_argument(f"--remote-debugging-port={CHROME_DEBUG_PORT}")
+                options.add_argument(f"--remote-debugging-port={int(remote_debugging_port)}")
                 options.add_argument(f"--remote-debugging-address={CHROME_DEBUG_HOST}")
             if KEEP_BROWSER_OPEN_ON_EXIT:
                 options.add_experimental_option("detach", True)
@@ -2620,6 +2630,11 @@ def reader_url_has_page(url: str) -> bool:
     return any(key.lower() == "page" for key, _ in parse_qsl(parsed.query, keep_blank_values=True))
 
 
+def supports_url_idempotency(reader_layout: str) -> bool:
+    """Continuous blocks share one browser URL and require element-level identity."""
+    return reader_layout != "continuous"
+
+
 def canonical_read_marker_key(url: str, marker_y: Optional[int] = None) -> str:
     """Keep numbered reader pages distinct while ignoring transient UI state."""
     parsed = urlsplit(url)
@@ -4142,7 +4157,7 @@ def process_chapters(
                 if effective_layout in {"paginated", "mixed"}
                 else canonical_read_marker_key(driver.current_url)
             )
-            if effective_layout != "continuous" or reader_url_has_page(driver.current_url):
+            if supports_url_idempotency(effective_layout):
                 already_submitted = any(
                     record.get("status") == "submitted"
                     and (
@@ -4173,9 +4188,7 @@ def process_chapters(
                     current_url = next_url
                     next_context_min_y = 0
                     continue
-            marker_skip_supported = (
-                effective_layout != "continuous" or reader_url_has_page(driver.current_url)
-            )
+            marker_skip_supported = supports_url_idempotency(effective_layout)
             normalized_read_markers = (
                 {canonical_chapter_url(marker) for marker in read_markers}
                 if effective_layout in {"paginated", "mixed"}
@@ -4646,18 +4659,37 @@ def main() -> int:
             run_reporter=run_reporter,
         )
         logging.info("Run complete. Chapters processed: %s.", completed)
-        if completed:
+        if completed >= args.max_chapters:
             logging.info("RUN_OUTCOME: completed with %s processed chapter(s).", completed)
+            run_status = "completed"
+            run_stage = "completed"
+            stop_reason = ""
+        elif completed:
+            logging.warning(
+                "RUN_OUTCOME: partial run; processed %s of %s requested chapter(s).",
+                completed,
+                args.max_chapters,
+            )
+            run_status = "partial"
+            run_stage = "partial"
+            stop_reason = (
+                f"The run ended after {completed} of {args.max_chapters} requested chapters. "
+                "Review the final RUN_STOP_REASON entry in the log."
+            )
         else:
             logging.warning("RUN_OUTCOME: no chapters were processed.")
+            run_status = "failed"
+            run_stage = "failed"
+            stop_reason = "No chapters were processed. Review the run log for the first blocking condition."
         if run_reporter:
             run_reporter.update(
-                status="completed",
-                stage="completed",
+                status=run_status,
+                stage=run_stage,
                 progress_current=completed,
                 progress_total=args.max_chapters,
+                stop_reason=stop_reason,
             )
-        return 0
+        return 0 if completed else 1
     except Exception as exc:
         logging.exception("Automation failed: %s", exc)
         if run_reporter:

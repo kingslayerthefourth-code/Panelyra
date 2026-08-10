@@ -2,7 +2,8 @@
 
 set -e
 
-PANELYRA_DIR="/Users/firdousmaliyekkal/Documents/AsuraAutomations"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PANELYRA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PANELYRA_LAUNCHER="$PANELYRA_DIR/Launch_Panelyra.command"
 
 if [ ! -x "$PANELYRA_LAUNCHER" ]; then

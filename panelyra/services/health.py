@@ -52,7 +52,7 @@ def environment_health() -> list[dict[str, str]]:
         {
             "check": "Google Chrome",
             "status": "Ready" if chrome_path.exists() else "Missing",
-            "detail": str(chrome_path),
+            "detail": "Detected" if chrome_path.exists() else "Install Google Chrome",
         }
     )
 
@@ -61,7 +61,7 @@ def environment_health() -> list[dict[str, str]]:
         {
             "check": "Browser profile",
             "status": "Ready" if profile_path.exists() else "Not initialized",
-            "detail": str(profile_path),
+            "detail": "Panelyra browser profile",
         }
     )
 
@@ -70,7 +70,7 @@ def environment_health() -> list[dict[str, str]]:
         {
             "check": "Workspace",
             "status": "Ready" if writable else "Read only",
-            "detail": str(PROJECT_ROOT),
+            "detail": "Panelyra workspace",
         }
     )
 

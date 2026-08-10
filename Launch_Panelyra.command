@@ -33,11 +33,24 @@ if ! "$PYTHON_RUNNER" -c "import streamlit" >/dev/null 2>&1; then
 fi
 
 echo "Launching Panelyra Control"
-while lsof -nP -iTCP:"$PANELYRA_PORT" -sTCP:LISTEN >/dev/null 2>&1; do
-  PANELYRA_PORT=$((PANELYRA_PORT + 1))
-done
-
 DASHBOARD_URL="http://127.0.0.1:$PANELYRA_PORT"
+
+if curl -fsS --max-time 2 "$DASHBOARD_URL/_stcore/health" >/dev/null 2>&1; then
+  echo "Panelyra is already running at $DASHBOARD_URL"
+  if [ "$PANELYRA_OPEN_BROWSER" = "true" ]; then
+    open "$DASHBOARD_URL"
+  fi
+  exit 0
+fi
+
+if lsof -nP -iTCP:"$PANELYRA_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port $PANELYRA_PORT is occupied by another application."
+  echo "Close that application or set PANELYRA_PORT to another fixed port."
+  echo "Press any key to close this window."
+  read -n 1 -s
+  exit 1
+fi
+
 echo "Dashboard: $DASHBOARD_URL"
 echo "Project: $APP_DIR"
 echo

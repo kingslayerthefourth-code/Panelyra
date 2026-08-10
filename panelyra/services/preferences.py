@@ -32,8 +32,18 @@ def load_preferences() -> dict[str, Any]:
     return values
 
 
-def save_preferences(values: dict[str, Any]) -> None:
-    PREFERENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+def save_preferences(values: dict[str, Any]) -> bool:
+    temporary: Path | None = None
     temporary = PREFERENCES_FILE.with_name(f".{PREFERENCES_FILE.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(values, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, PREFERENCES_FILE)
+    try:
+        PREFERENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(values, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, PREFERENCES_FILE)
+    except OSError:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        return False
+    return True

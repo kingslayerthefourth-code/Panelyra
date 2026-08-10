@@ -48,7 +48,7 @@ WORKSPACES = {
 
 
 NAVIGATION_GROUPS = {
-    "Workspace": ["Dashboard", "Engage", "Capture", "Studio"],
+    "Workspace": ["Dashboard", "Reader", "Engage", "Capture", "Studio"],
     "Operations": ["Assistant", "Run History", "Settings", "Help"],
 }
 

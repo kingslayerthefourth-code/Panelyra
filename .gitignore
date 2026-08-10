@@ -14,6 +14,8 @@ runs/
 failure_artifacts/
 backups/
 manhwa/
+manhwa_clean/
+uploads/
 test_reports/
 config/preferences.json
 config/workflow_presets.json

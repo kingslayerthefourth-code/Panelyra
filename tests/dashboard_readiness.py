@@ -38,7 +38,8 @@ def open_workspace(app: AppTest, dashboard_label: str) -> None:
 
 
 def main() -> int:
-    app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+    # Cold imports include OCR and browser integration modules on local machines.
+    app = AppTest.from_file(str(APP_PATH), default_timeout=45).run()
     assert_ready(app, "Dashboard")
 
     for label in ("Start Comment Testing", "Start Chapter Capture", "Start Creative Studio"):
@@ -69,8 +70,8 @@ def main() -> int:
     assert "Continue to review" in button_map(app)
     button_map(app)["Continue to review"].click().run()
     assert app.session_state["ocr_start_url"] == capture_url
-    assert "Start capture" in button_map(app)
-    assert not button_map(app)["Start capture"].disabled
+    assert "Start Capture" in button_map(app)
+    assert not button_map(app)["Start Capture"].disabled
     assert_ready(app, "Capture review")
 
     app.session_state["page"] = "Dashboard"
@@ -79,10 +80,12 @@ def main() -> int:
     assert "Continue to design" in button_map(app)
     assert_ready(app, "Studio source")
 
-    for page in ("Assistant", "Run History", "Settings", "Help"):
+    for page in ("Reader", "Assistant", "Run History", "Settings", "Help"):
         app.session_state["page"] = page
         app.run()
         assert_ready(app, page)
+        if page == "Reader":
+            assert app.selectbox, "Reader did not provide a series selector"
         if page == "Assistant":
             assert app.radio
             assert app.radio[0].label == "Assistant mode"

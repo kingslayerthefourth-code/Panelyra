@@ -15,9 +15,12 @@ READER_LAYOUTS = ("auto", "continuous", "next-chapter", "paginated", "mixed")
 
 DEFAULT_NEXT_PAGE_SELECTOR = (
     "a.next-page, button.next-page, [data-testid*='next-page' i], "
+    "a[class*='next-page' i], button[class*='next-page' i], "
     "a[aria-label*='next page' i], button[aria-label*='next page' i], "
     "a[title*='next page' i], button[title*='next page' i], "
-    ".pagination-next a, .pagination-next button, .reader-next-page"
+    "[data-action*='next-page' i], [data-page-action='next' i], "
+    ".pagination-next a, .pagination-next button, .reader-next-page, "
+    ".pagination .next a, .pagination .next button"
 )
 DEFAULT_PAGE_COUNTER_SELECTOR = (
     "[data-testid*='page-count' i], [aria-label*='page' i], "
@@ -25,13 +28,15 @@ DEFAULT_PAGE_COUNTER_SELECTOR = (
 )
 DEFAULT_NEXT_CHAPTER_SELECTOR = (
     "a.next-chapter, button.next-chapter, [data-testid*='next-chapter' i], "
+    "a[class*='next-chapter' i], button[class*='next-chapter' i], "
     "a.next-episode, button.next-episode, [data-testid*='next-episode' i], "
+    "a[class*='next-episode' i], button[class*='next-episode' i], "
     "a[aria-label*='next chapter' i], button[aria-label*='next chapter' i], "
     "a[aria-label*='next episode' i], button[aria-label*='next episode' i], "
     "a[title*='next chapter' i], button[title*='next chapter' i], "
     "a[title*='next episode' i], button[title*='next episode' i], "
     "[data-action*='next-chapter' i], [data-action*='next-episode' i], "
-    "a[rel='next']"
+    "a[rel='next'][href*='chapter' i], a[rel='next'][href*='episode' i]"
 )
 DEFAULT_CHAPTER_LIST_SELECTOR = (
     "a[href*='chapter' i], a[href*='episode' i], "
@@ -63,6 +68,7 @@ class ReaderSnapshot:
     has_next_chapter: bool
     scroll_height: int
     viewport_height: int
+    chapter_marker_count: int = 0
 
 
 def parse_page_counter_text(value: str) -> tuple[int, int]:
@@ -104,8 +110,30 @@ def reader_snapshot(driver: object, selectors: ReaderSelectors) -> ReaderSnapsho
         };
         const text = node => [
             node.innerText || "", node.textContent || "",
-            node.getAttribute("aria-label") || "", node.getAttribute("title") || ""
+            node.getAttribute("aria-label") || "", node.getAttribute("title") || "",
+            node.getAttribute("data-action") || "", node.id || "", String(node.className || "")
         ].join(" ").replace(/\\s+/g, " ").trim();
+        const href = node => {
+            try { return new URL(node.href || node.getAttribute("data-href") || "", location.href); }
+            catch (_) { return null; }
+        };
+        const pageValue = url => {
+            if (!url) return null;
+            for (const key of ["page", "p", "reader_page"]) {
+                const value = url.searchParams.get(key);
+                if (value !== null && /^\\d+$/.test(value)) return Number(value);
+            }
+            return null;
+        };
+        const canonical = url => {
+            if (!url) return "";
+            const copy = new URL(url.href);
+            for (const key of ["page", "p", "reader_page", "scroll", "comment"]) {
+                copy.searchParams.delete(key);
+            }
+            copy.hash = "";
+            return (copy.origin + copy.pathname.replace(/\\/$/, "") + "?" + copy.searchParams).replace(/\\?$/, "");
+        };
         let current = 0, total = 0;
         const counters = [
             ...safeAll(pageCounterSelector),
@@ -125,12 +153,39 @@ def reader_snapshot(driver: object, selectors: ReaderSelectors) -> ReaderSnapsho
             image.currentSrc || image.src || image.getAttribute("data-src") || ""
         ).filter(Boolean);
         const semanticNodes = safeAll("a,button,[role='button']");
+        const currentUrl = new URL(location.href);
+        const currentPage = pageValue(currentUrl);
+        const configuredPageNodes = new Set(safeAll(nextPageSelector));
+        const configuredChapterNodes = new Set(safeAll(nextChapterSelector));
+        const explicitPage = node => /\\bnext\\s+page\\b|\\bpage\\s+next\\b|next-page|pagination-next/i.test(text(node));
+        const explicitChapter = node => /\\bnext\\s+(chapter|episode)\\b|\\b(chapter|episode)\\s+next\\b|next-(chapter|episode)/i.test(text(node));
+        const pageHref = node => {
+            const target = href(node), targetPage = pageValue(target);
+            return target && targetPage !== null && targetPage !== currentPage
+                && canonical(target) === canonical(currentUrl);
+        };
+        const chapterHref = node => {
+            const target = href(node);
+            if (!target || canonical(target) === canonical(currentUrl) || pageHref(node)) return false;
+            return /(?:chapter|chap|episode|(?:^|[-_/])ch|(?:^|[-_/])ep)[-_/.:]*\\d/i.test(target.pathname);
+        };
         const semanticNextPage = semanticNodes.some(node =>
-            visible(node) && /\\bnext\\s+page\\b|\\bpage\\s+next\\b/i.test(text(node))
+            visible(node) && (explicitPage(node) || configuredPageNodes.has(node) || pageHref(node))
+                && !explicitChapter(node)
         );
         const semanticNextChapter = semanticNodes.some(node =>
-            visible(node) && /\\bnext\\s+(chapter|episode)\\b|\\b(chapter|episode)\\s+next\\b/i.test(text(node))
+            visible(node) && (explicitChapter(node) || chapterHref(node)
+                || (configuredChapterNodes.has(node) && !explicitPage(node) && !pageHref(node)))
         );
+        const chapterMarkers = safeAll(
+            "[data-chapter-id], [data-chapter-number], article[id*='chapter' i], " +
+            "section[id*='chapter' i], article[class*='chapter' i], section[class*='chapter' i]"
+        ).filter(node => {
+            if (!visible(node)) return false;
+            const rect = node.getBoundingClientRect();
+            return rect.height >= Math.max(400, (window.innerHeight || 800) * 0.5)
+                && node.querySelector("img, picture, canvas");
+        });
         return {
             url: location.href,
             title: document.title || "",
@@ -142,7 +197,8 @@ def reader_snapshot(driver: object, selectors: ReaderSelectors) -> ReaderSnapsho
             hasNextPage: safeAll(nextPageSelector).some(visible) || semanticNextPage,
             hasNextChapter: safeAll(nextChapterSelector).some(visible) || semanticNextChapter,
             scrollHeight: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
-            viewportHeight: window.innerHeight || 0
+            viewportHeight: window.innerHeight || 0,
+            chapterMarkerCount: chapterMarkers.length
         };
     """
     try:
@@ -167,14 +223,22 @@ def reader_snapshot(driver: object, selectors: ReaderSelectors) -> ReaderSnapsho
         has_next_chapter=bool(raw.get("hasNextChapter", False)),
         scroll_height=int(raw.get("scrollHeight", 0) or 0),
         viewport_height=int(raw.get("viewportHeight", 0) or 0),
+        chapter_marker_count=int(raw.get("chapterMarkerCount", 0) or 0),
     )
 
 
 def classify_reader_layout(snapshot: ReaderSnapshot, preferred: str = "auto") -> str:
     if preferred in READER_LAYOUTS and preferred != "auto":
         return preferred
-    paginated = snapshot.page_total > 1 or snapshot.has_next_page
-    if snapshot.visible_comment_editors > 1:
+    all_counter_pages_in_dom = (
+        snapshot.page_total > 1
+        and snapshot.image_count >= snapshot.page_total
+        and not snapshot.has_next_page
+    )
+    paginated = snapshot.has_next_page or (
+        snapshot.page_total > 1 and not all_counter_pages_in_dom
+    )
+    if snapshot.visible_comment_editors > 1 or snapshot.chapter_marker_count > 1:
         return "continuous"
     if paginated and snapshot.has_next_chapter:
         return "mixed"
@@ -239,6 +303,36 @@ def _click_control(
             node.getAttribute("title") || "", node.getAttribute("rel") || "",
             node.id || "", String(node.className || "")
         ].join(" ").replace(/\\s+/g, " ").trim().toLowerCase();
+        const href = node => {
+            try { return new URL(node.href || node.getAttribute("data-href") || "", location.href); }
+            catch (_) { return null; }
+        };
+        const pageValue = url => {
+            if (!url) return null;
+            for (const key of ["page", "p", "reader_page"]) {
+                const value = url.searchParams.get(key);
+                if (value !== null && /^\\d+$/.test(value)) return Number(value);
+            }
+            return null;
+        };
+        const canonical = url => {
+            if (!url) return "";
+            const copy = new URL(url.href);
+            for (const key of ["page", "p", "reader_page", "scroll", "comment"]) copy.searchParams.delete(key);
+            copy.hash = "";
+            return (copy.origin + copy.pathname.replace(/\\/$/, "") + "?" + copy.searchParams).replace(/\\?$/, "");
+        };
+        const currentUrl = new URL(location.href);
+        const pageHref = node => {
+            const target = href(node), targetPage = pageValue(target);
+            return target && targetPage !== null && targetPage !== pageValue(currentUrl)
+                && canonical(target) === canonical(currentUrl);
+        };
+        const chapterHref = node => {
+            const target = href(node);
+            return Boolean(target && !pageHref(node) && canonical(target) !== canonical(currentUrl)
+                && /(?:chapter|chap|episode|(?:^|[-_/])ch|(?:^|[-_/])ep)[-_/.:]*\\d/i.test(target.pathname));
+        };
         const semantic = safeAll("a,button,[role='button']");
         let candidates = [...safeAll(selector), ...semantic].filter(visible);
         candidates = Array.from(new Set(candidates)).filter(node => {
@@ -247,11 +341,13 @@ def _click_control(
                 if (/prev|previous|back/.test(text)) return false;
                 if (/next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(text)) return false;
                 return /next\\s+page|page\\s+next|pagination-next|reader-next-page/.test(text)
-                    || safeAll(selector).includes(node);
+                    || pageHref(node)
+                    || (safeAll(selector).includes(node) && !chapterHref(node));
             }
             if (/prev|previous|back/.test(text)) return false;
             return /next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(text)
-                || safeAll(selector).includes(node);
+                || chapterHref(node)
+                || (safeAll(selector).includes(node) && !pageHref(node));
         });
         if (kind === "page" && pageTotal > 0 && pageCurrent >= pageTotal) return false;
         if (!candidates.length && kind === "page") {
@@ -332,9 +428,27 @@ def next_chapter_href(driver: object, selectors: ReaderSelectors) -> str:
             node.getAttribute("title") || "", node.getAttribute("rel") || "",
             node.id || "", String(node.className || "")
         ].join(" ").replace(/\\s+/g, " ").trim().toLowerCase();
+        const canonical = value => {
+            try {
+                const url = new URL(value, location.href);
+                for (const key of ["page", "p", "reader_page", "scroll", "comment"]) url.searchParams.delete(key);
+                url.hash = "";
+                return (url.origin + url.pathname.replace(/\\/$/, "") + "?" + url.searchParams).replace(/\\?$/, "");
+            } catch (_) { return ""; }
+        };
+        const chapterHref = node => {
+            const value = node.href || node.getAttribute("data-href") || "";
+            if (!value || canonical(value) === canonical(location.href)) return false;
+            try {
+                return /(?:chapter|chap|episode|(?:^|[-_/])ch|(?:^|[-_/])ep)[-_/.:]*\\d/i.test(
+                    new URL(value, location.href).pathname
+                );
+            } catch (_) { return false; }
+        };
         const configured = safeAll(selector);
         const semantic = safeAll("a[href],button,[role='button']").filter(node =>
             /next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(label(node))
+                || chapterHref(node)
         );
         const candidates = Array.from(new Set([...semantic, ...configured])).filter(visible);
         candidates.sort((a, b) => {
@@ -342,7 +456,8 @@ def next_chapter_href(driver: object, selectors: ReaderSelectors) -> str:
             const bScore = /next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(label(b)) ? 100 : 0;
             return bScore - aScore;
         });
-        const anchor = candidates.find(node => node.href);
+        const anchor = candidates.find(node => node.href && chapterHref(node))
+            || candidates.find(node => node.href);
         return anchor ? anchor.href : "";
     """
     try:

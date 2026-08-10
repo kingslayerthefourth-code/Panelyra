@@ -57,15 +57,22 @@ class ChapterListDriver:
 def main() -> int:
     assert "next chapter" in engage.NEXT_LINK_SELECTOR.lower()
     assert "aria-label*='next' i" not in engage.NEXT_LINK_SELECTOR.lower()
+    assert "a[rel='next']" not in {
+        item.strip() for item in engage.NEXT_LINK_SELECTOR.lower().split(",")
+    }
     for comic_mode in ("comic", "manga", "manhwa", "manhua"):
         assert engage.normalize_content_mode(comic_mode) == "manhwa"
     assert engage.normalize_content_mode("novel") == "novel"
+    assert not engage.supports_url_idempotency("continuous")
+    assert engage.supports_url_idempotency("paginated")
+    assert engage.supports_url_idempotency("next-chapter")
 
     assert parse_page_counter_text("14 / 14") == (14, 14)
     assert parse_page_counter_text("Page 3 of 22") == (3, 22)
     assert parse_page_counter_text("not a counter") == (0, 0)
 
     assert classify_reader_layout(snapshot(visible_comment_editors=3), "auto") == "continuous"
+    assert classify_reader_layout(snapshot(chapter_marker_count=3), "auto") == "continuous"
     assert classify_reader_layout(
         snapshot(page_current=1, page_total=12, has_next_page=True),
         "auto",
@@ -75,6 +82,14 @@ def main() -> int:
         "auto",
     ) == "mixed"
     assert classify_reader_layout(snapshot(has_next_chapter=True), "auto") == "next-chapter"
+    assert classify_reader_layout(
+        snapshot(page_current=14, page_total=14, image_count=14, has_next_chapter=True),
+        "auto",
+    ) == "next-chapter"
+    assert classify_reader_layout(
+        snapshot(page_current=14, page_total=14, image_count=14),
+        "auto",
+    ) == "continuous"
     assert classify_reader_layout(snapshot(), "paginated") == "paginated"
 
     assert canonical_chapter_url(

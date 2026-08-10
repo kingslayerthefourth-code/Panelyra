@@ -289,6 +289,7 @@ def _extract_manhwa_content(
     min_y: float | None = None,
     max_y: float | None = None,
     image_urls: list[str] | None = None,
+    image_files: list[str] | None = None,
 ) -> str:
     reader = _get_easyocr_reader()
     images: list[Any] = []
@@ -300,7 +301,12 @@ def _extract_manhwa_content(
     processed = 0
     targets: list[tuple[str, Any | None]] = []
 
-    if image_urls is not None:
+    if image_files is not None:
+        for raw_path in image_files:
+            image_path = Path(raw_path)
+            if image_path.is_file():
+                targets.append((str(image_path), None))
+    elif image_urls is not None:
         seen_urls: set[str] = set()
         for raw_url in image_urls:
             image_url = urljoin(base_url, str(raw_url).strip())
@@ -318,7 +324,15 @@ def _extract_manhwa_content(
             targets.append((image_url, image))
 
     for image_url, image in targets:
-        image_bytes = _fetch_image_bytes(driver, image_url, timeout_seconds)
+        local_path = Path(image_url)
+        if image_files is not None and local_path.is_file():
+            try:
+                image_bytes = local_path.read_bytes()
+            except OSError as exc:
+                logging.warning("Skipping local OCR image read failure for %s: %s", local_path, exc)
+                image_bytes = None
+        else:
+            image_bytes = _fetch_image_bytes(driver, image_url, timeout_seconds)
         if image_bytes is None and image is not None:
             try:
                 image_bytes = image.screenshot_as_png
@@ -372,6 +386,7 @@ def extract_chapter_content(driver: Any, container_selector: str, settings: dict
             min_y=_coerce_float(settings["min_y"], 0.0) if settings.get("min_y") is not None else None,
             max_y=_coerce_float(settings["max_y"], 0.0) if settings.get("max_y") is not None else None,
             image_urls=[str(url) for url in settings.get("image_urls", [])] if settings.get("image_urls") else None,
+            image_files=[str(path) for path in settings.get("image_files", [])] if settings.get("image_files") else None,
         )
 
     raise ValueError("settings['mode'] must be either 'novel' or 'manhwa'.")

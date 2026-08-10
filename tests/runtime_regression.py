@@ -16,7 +16,10 @@ from automation_runtime import (
     BrowserBusyError,
     RunRecord,
     RunStore,
+    TrackedProcessRef,
     acquire_browser_lock,
+    active_run_records,
+    macos_sleep_guard_command,
     reconcile_stale_run_records,
     release_browser_lock,
 )
@@ -63,6 +66,45 @@ def main() -> int:
         payload = json.loads(store.path.read_text(encoding="utf-8"))
         assert payload["status"] == "failed"
         assert payload["stage"] == "process-exited"
+
+        live_record = RunRecord.create("comment", {"start_url": "https://reader.test"}, root / "live.log")
+        live_store = RunStore(live_record, root=runs_root)
+        live_store.update(status="running", stage="scanning", pid=multiprocessing.current_process().pid)
+        active = active_run_records(runs_root)
+        assert active["comment"]["pid"] == multiprocessing.current_process().pid
+        live_ref = TrackedProcessRef(multiprocessing.current_process().pid)
+        assert live_ref.poll() is None
+
+        caffeinate_path = root / "caffeinate"
+        caffeinate_path.touch()
+        assert macos_sleep_guard_command(
+            4321,
+            platform_name="darwin",
+            caffeinate_path=caffeinate_path,
+        ) == [
+            str(caffeinate_path),
+            "-i",
+            "-m",
+            "-u",
+            "-w",
+            "4321",
+        ]
+        assert (
+            macos_sleep_guard_command(
+                4321,
+                platform_name="linux",
+                caffeinate_path=caffeinate_path,
+            )
+            is None
+        )
+        assert (
+            macos_sleep_guard_command(
+                0,
+                platform_name="darwin",
+                caffeinate_path=caffeinate_path,
+            )
+            is None
+        )
 
     print("Runtime regression checks passed.")
     return 0
