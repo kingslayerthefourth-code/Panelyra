@@ -410,7 +410,8 @@ def main() -> int:
         return 0
     except Exception as exc:
         if reporter:
-            reporter.update(status="failed", stage="failed", stop_reason=str(exc))
+            reason = bot.friendly_browser_error(exc)
+            reporter.update(status="failed", stage="failed", stop_reason=reason, message=reason)
         logging.exception("Word-art note automation failed: %s", exc)
         return 1
     finally:

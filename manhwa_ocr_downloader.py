@@ -12,6 +12,7 @@ import argparse
 import base64
 import json
 import logging
+import os
 import re
 import shutil
 import sys
@@ -48,21 +49,23 @@ from reader_routing import (
 )
 
 
-MAX_CHAPTERS = 20
+MAX_CHAPTERS = 10000
 CAPTURE_PERFORMANCE_PROFILES = {
     "reliable": {"stable_rounds": 6, "max_rounds": 30, "download_workers": 4},
-    "balanced": {"stable_rounds": 3, "max_rounds": 18, "download_workers": 6},
-    "rapid": {"stable_rounds": 2, "max_rounds": 12, "download_workers": 8},
+    "balanced": {"stable_rounds": 3, "max_rounds": 18, "download_workers": 4},
+    "rapid": {"stable_rounds": 2, "max_rounds": 12, "download_workers": 4},
 }
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "manhwa"
 PROJECT_ROOT = Path(__file__).resolve().parent
+# Keep Capture's automation data outside Chrome's protected application-data
+# directory. Do not migrate/delete the legacy profile or its saved logins.
 DEFAULT_DOWNLOAD_CHROME_PROFILE = (
     Path.home()
     / "Library"
     / "Application Support"
-    / "Google"
+    / "Panelyra"
     / "Chrome"
-    / "PanelyraDownloadProfile"
+    / "CaptureProfile"
 )
 DOWNLOAD_DEBUG_PORT = 9223
 DOWNLOAD_BROWSER_LOCK = Path(tempfile.gettempdir()) / "panelyra-capture-browser.lock"
@@ -93,7 +96,7 @@ class ChapterDownload:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Archive and OCR up to 20 authorized manga, manhwa, or manhua chapters."
+        description="Archive authorized chapters in bounded, resumable browser chunks."
     )
     parser.add_argument("--start-url", required=True, help="First chapter URL, or a series page with a detectable first chapter.")
     parser.add_argument("--max-chapters", type=int, default=1, help=f"Number of chapters to OCR. Hard capped at {MAX_CHAPTERS}.")
@@ -106,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         "--chrome-profile-dir",
         type=Path,
         default=DEFAULT_DOWNLOAD_CHROME_PROFILE,
-        help="Persistent Chrome profile used only by Capture.",
+        help="Persistent Capture-only Chrome profile; defaults to Panelyra's application-data directory.",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for captured chapters and OCR output.")
     parser.add_argument("--content-container-selector", default=bot.CONTENT_SELECTOR, help="Container selector for chapter images.")
@@ -156,6 +159,15 @@ def driver_session_lost(exc: BaseException) -> bool:
     return isinstance(exc, WebDriverException) and any(
         fragment in message for fragment in LOST_DRIVER_MESSAGES
     )
+
+
+def friendly_browser_error(exc: BaseException) -> str:
+    if driver_session_lost(exc):
+        return (
+            "Chrome was closed or disconnected during Capture. Completed downloads are safe. "
+            "Open Capture review, confirm the chapter page, and retry to continue."
+        )
+    return str(exc)
 
 
 def safe_driver_url(driver: object, fallback: str = "") -> str:
@@ -565,7 +577,26 @@ def resolve_series_output_dir(
     output_root: Path,
     series_title: str,
     series_slug: str,
+    source_url: str = "",
 ) -> Path:
+    if source_url:
+        from panelyra.services.library_store import canonical_source, stable_id
+        from panelyra.services.download_identity import language_of
+        source=canonical_source(source_url)
+        if not source:raise ValueError('A source identity is required before saving a book.')
+        language=language_of({'url':source_url},series_slug)
+        for folder in sorted(output_root.iterdir()) if output_root.is_dir() else []:
+            if not folder.is_dir() or folder.is_symlink() or folder.name.startswith('.'):continue
+            for path in folder.glob('*/metadata.json'):
+                if path.is_symlink():continue
+                meta=read_json_payload(path)
+                if isinstance(meta,dict) and canonical_source(meta.get('series_url') or meta.get('url') or '')==source and language_of(meta,folder.name)==language:
+                    return folder
+        # An equal display title on another source never reuses or migrates a folder.
+        destination=output_root/(series_slug+'-'+stable_id(source,language)[:10])
+        if destination.is_symlink():raise ValueError('Linked output folders are not supported.')
+        destination.mkdir(parents=True,exist_ok=True)
+        return destination
     canonical = output_root / series_slug
     series_dir: Optional[Path] = canonical if canonical.is_dir() else None
 
@@ -602,7 +633,14 @@ def resolve_series_output_dir(
 
 
 PROMOTIONAL_PATTERN = re.compile(
-    r"discord|telegram|scanlation|credit|advert|promo|patreon|donat|logo|avatar|favicon|banner",
+    r"discord|telegram|scanlation|credit|advert|promo|patreon|donat|logo|avatar|favicon|banner|"
+    r"(?:^|[-_.])ads?(?:[-_.]|$)|sponsor|campaign|monetiz|native[-_.]?ad",
+    re.IGNORECASE,
+)
+AD_HOST_PATTERN = re.compile(
+    r"(?:^|\.)(?:doubleclick\.net|googlesyndication\.com|googleadservices\.com|"
+    r"adservice\.google\.com|amazon-adsystem\.com|adnxs\.com|taboola\.com|"
+    r"outbrain\.com|criteo\.com|pubmatic\.com|rubiconproject\.com)$",
     re.IGNORECASE,
 )
 
@@ -611,7 +649,10 @@ def is_promotional_asset_url(value: str) -> bool:
     """Inspect the asset path, not its host, so reader domains are never excluded."""
     parsed = urlparse(value)
     asset_hint = f"{parsed.path.rsplit('/', 2)[-1]} {parsed.query}"
-    return bool(PROMOTIONAL_PATTERN.search(asset_hint))
+    return bool(
+        AD_HOST_PATTERN.search(parsed.hostname or "")
+        or PROMOTIONAL_PATTERN.search(asset_hint)
+    )
 
 
 def page_has_chapter_media(driver: object, image_selector: str) -> bool:
@@ -727,6 +768,34 @@ def visible_story_image_urls(
             const r = node.getBoundingClientRect(), s = getComputedStyle(node);
             return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
         };
+        const inAdContext = node => {
+            let current = node;
+            for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+                const marker = [
+                    current.id || "", String(current.className || ""),
+                    current.getAttribute?.("data-ad") || "",
+                    current.getAttribute?.("data-ad-slot") || "",
+                    current.getAttribute?.("data-ad-unit") || "",
+                    current.getAttribute?.("data-testid") || "",
+                    current.getAttribute?.("aria-label") || "",
+                    current.getAttribute?.("role") || ""
+                ].join(" ").toLowerCase();
+                if (
+                    /(?:^|[\\s_-])(?:ad|ads|advert|advertisement|sponsor|sponsored|promo|promoted)(?:$|[\\s_-])/.test(marker)
+                    || /adsbygoogle|ad-container|ad-wrapper|ad-slot|ad-unit|native-ad|commercial/.test(marker)
+                ) return true;
+            }
+            return false;
+        };
+        const panelGeometry = (rect, width, height, hasReaderRoot) => {
+            const minimumWidth = hasReaderRoot ? 180 : 280;
+            const minimumHeight = hasReaderRoot ? 260 : 400;
+            if (Math.max(width, rect.width) < minimumWidth) return false;
+            if (Math.max(height, rect.height) < minimumHeight) return false;
+            const effectiveWidth = Math.max(1, width, rect.width);
+            const effectiveHeight = Math.max(height, rect.height);
+            return effectiveHeight >= effectiveWidth * 0.52;
+        };
         const nodes = Array.from(document.querySelectorAll("button,a,h1,h2,h3,section,div"));
         const boundaries = nodes.filter(node => {
             if (!visible(node)) return false;
@@ -760,13 +829,17 @@ def visible_story_image_urls(
         for (const image of safeAll(selector)) {
             if (!inReader(image)) continue;
             if (!visible(image)) continue;
+            if (inAdContext(image)) continue;
             const rect = image.getBoundingClientRect();
             const y = rect.top + scrollY;
             const naturalWidth = Number(image.naturalWidth || rect.width);
             const naturalHeight = Number(image.naturalHeight || rect.height);
             if (y < Math.max(120, minY) || y >= boundaryY) continue;
-            if (Math.max(naturalWidth, rect.width) < 180 || Math.max(naturalHeight, rect.height) < 260) continue;
-            const ancestorText = (image.closest("header,nav,aside,footer,[class*='comment'],[class*='promo'],[class*='advert']")?.innerText || "");
+            if (!panelGeometry(rect, naturalWidth, naturalHeight, readerRoots.length > 0)) continue;
+            const ancestorText = (image.closest(
+                "header,nav,aside,footer,[class*='comment'],[class*='promo'],[class*='advert'],"
+                + "[class*='sponsor'],[id*='advert'],[data-ad],[data-ad-slot],[data-ad-unit]"
+            )?.innerText || "");
             if (/discord|telegram|scanlation|patreon|advert|promotion|donat/i.test(ancestorText)) continue;
             const source = image.closest("picture")?.querySelector("source[srcset]");
             const candidates = [
@@ -783,9 +856,11 @@ def visible_story_image_urls(
         for (const node of backgroundNodes) {
             if (!inReader(node)) continue;
             if (!visible(node)) continue;
+            if (inAdContext(node)) continue;
             const rect = node.getBoundingClientRect();
             const y = rect.top + scrollY;
-            if (y < Math.max(120, minY) || y >= boundaryY || rect.width < 180 || rect.height < 260) continue;
+            if (y < Math.max(120, minY) || y >= boundaryY) continue;
+            if (!panelGeometry(rect, rect.width, rect.height, readerRoots.length > 0)) continue;
             const match = (getComputedStyle(node).backgroundImage || "").match(/url\\(["']?(.*?)["']?\\)/i);
             const src = absolute(match ? match[1] : "");
             if (src) results.push(src);
@@ -793,10 +868,16 @@ def visible_story_image_urls(
         for (const [index, canvas] of safeAll("canvas").entries()) {
             if (!inReader(canvas)) continue;
             if (!visible(canvas)) continue;
+            if (inAdContext(canvas)) continue;
             const rect = canvas.getBoundingClientRect();
             const y = rect.top + scrollY;
             if (y < Math.max(120, minY) || y >= boundaryY) continue;
-            if (Math.max(canvas.width || 0, rect.width) < 180 || Math.max(canvas.height || 0, rect.height) < 260) continue;
+            if (!panelGeometry(
+                rect,
+                Number(canvas.width || rect.width),
+                Number(canvas.height || rect.height),
+                readerRoots.length > 0
+            )) continue;
             results.push(`panelyra-canvas://${index}`);
         }
         return Array.from(new Set(results));
@@ -1135,7 +1216,10 @@ def collect_chapter_image_urls(
     all_urls: list[str] = []
     seen: set[str] = set()
     seen_states: set[tuple[str, int, str]] = set()
-    for page_attempt in range(1, 201):
+    if first_snapshot.page_total > 2000:
+        raise ValueError('Reader exceeds the 2,000-page chapter safety limit.')
+    reached_end = False
+    for page_attempt in range(1, 2001):
         for url in collect_story_image_urls(
             driver,
             image_selector,
@@ -1150,8 +1234,7 @@ def collect_chapter_image_urls(
         snapshot = reader_snapshot(driver, selectors)
         state_key = (snapshot.url, snapshot.page_current, snapshot.image_signature)
         if state_key in seen_states:
-            logging.warning("Capture pagination repeated a reader state; stopping page traversal.")
-            break
+            raise ValueError('Reader pagination repeated before its final page; chapter was not published.')
         seen_states.add(state_key)
         logging.info(
             "Reader media progress: page %s/%s, %s unique image(s).",
@@ -1159,7 +1242,8 @@ def collect_chapter_image_urls(
             snapshot.page_total or "?",
             len(all_urls),
         )
-        if snapshot.page_total and snapshot.page_current >= min(snapshot.page_total, 200):
+        if snapshot.page_total and snapshot.page_current >= snapshot.page_total:
+            reached_end = True
             break
 
         query_state = page_query_state(snapshot.url)
@@ -1177,7 +1261,12 @@ def collect_chapter_image_urls(
             continue
 
         if advance_reader_page(driver, selectors) is None:
+            if snapshot.page_total and snapshot.page_current < snapshot.page_total:
+                raise ValueError('Reader navigation stopped before its declared final page.')
+            reached_end = not snapshot.page_total
             break
+    if not reached_end:
+        raise ValueError('Reader did not reach a verified pagination end; chapter was retained as unfinished.')
     return all_urls
 
 
@@ -1318,23 +1407,19 @@ def is_image_payload(payload: bytes) -> bool:
     return image_extension_from_payload("", payload) != ".jpg" or payload.startswith(b"\xff\xd8\xff")
 
 
-def _download_image(item: tuple[int, str], headers: dict[str, str], timeout_seconds: float) -> tuple[int, str, bytes]:
+def _download_image(item: tuple[int, str], headers: dict[str, str], timeout_seconds: float, cache=None) -> tuple[int, str, bytes]:
     index, url = item
     preferred_url = maximum_quality_image_url(url)
     candidates = [preferred_url] if preferred_url == url else [preferred_url, url]
     last_error: Exception | None = None
     for candidate in candidates:
         try:
-            response = _download_session().get(candidate, timeout=timeout_seconds, headers=headers)
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "").lower()
-            payload = response.content
-            if len(payload) < 512 or (
-                not content_type.startswith("image/") and not is_image_payload(payload)
-            ):
-                raise ValueError(
-                    f"Invalid image response ({content_type or 'unknown'}, {len(payload)} bytes)"
-                )
+            from panelyra.services.page_transfer import fetch_page
+            if cache is None:
+                with tempfile.TemporaryDirectory(prefix='panelyra-page-') as temporary:
+                    payload = fetch_page(_download_session(), candidate, headers, timeout_seconds, temporary)
+            else:
+                payload = fetch_page(_download_session(), candidate, headers, timeout_seconds, cache)
             if candidate != url:
                 logging.info("Downloaded maximum-quality panel source: %s", candidate)
             return index, candidate, payload
@@ -1442,12 +1527,16 @@ def save_images(
     output_dir.mkdir(parents=True, exist_ok=True)
     headers = request_headers(driver)
     saved = 0
-    with ThreadPoolExecutor(max_workers=min(max(1, download_workers), max(1, len(urls)))) as executor:
-        futures = [
-            executor.submit(_download_image, item, headers, timeout_seconds)
-            for item in enumerate(urls, start=1)
-        ]
-    for fallback_index, (future, source_url) in enumerate(zip(futures, urls), start=1):
+    workers = min(4, max(1, download_workers))
+    def bounded_results():
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for begin in range(0, len(urls), workers):
+                group = [(index + 1, urls[index]) for index in range(begin, min(len(urls), begin + workers))]
+                futures = [executor.submit(_download_image, item, headers, timeout_seconds,
+                                           output_dir.parent / '.http-pages') for item in group]
+                for item, future in zip(group, futures):
+                    yield item[0], future, item[1]
+    for fallback_index, future, source_url in bounded_results():
         url = source_url
         try:
             index, url, payload = future.result()
@@ -1577,6 +1666,12 @@ def next_chapter_from_series(driver: object, chapter_url: str, chapter_title_tex
             number, href, label = later[0]
             logging.info("Series chapter list resolved next chapter %s (%s): %s", number, label, href)
             return href
+        if parsed:
+            logging.info(
+                "Series chapter list contains no chapter after %s; refusing backward navigation.",
+                current_number,
+            )
+            return None
     if parsed:
         parsed.sort()
         number, href, label = parsed[0]
@@ -1656,11 +1751,38 @@ def ocr_current_chapter(
     if segment_min_y > 0:
         chapter_source_url = f"{chapter_source_url}#segment-y={segment_min_y}"
     title = chapter_title(driver, chapter_index)
-    chapter_dir = output_dir / chapter_folder_name(
+    destination = output_dir / chapter_folder_name(
         f"{title} {chapter_source_url}",
         chapter_index,
         segment_min_y=segment_min_y,
     )
+    if destination.exists() or destination.is_symlink():
+        # Publication may have committed just before a crash in the compatibility
+        # manifest write. Reconcile validated artifacts rather than downloading again.
+        from panelyra.services.library_store import validate_archive, decode_image
+        if destination.is_symlink():
+            raise ValueError('Existing chapter is a symbolic link; it was not overwritten.')
+        metadata = json.loads((destination/'metadata.json').read_text())
+        if metadata.get('url') != chapter_source_url:
+            raise ValueError('Existing chapter has a different source identity; no original was overwritten.')
+        archive = destination/'chapter-pages.cbz'
+        pages = validate_archive(archive) if archive.is_file() else [
+            (page.name, page.read_bytes()) for page in ordered_archive_images(destination/'images')]
+        if len(pages) != metadata.get('image_count') or not pages:
+            raise ValueError('Existing chapter is incomplete and was retained for review.')
+        for _, payload in pages:
+            decode_image(payload)
+        return ChapterDownload(index=chapter_index, url=chapter_source_url, title=str(metadata.get('title') or title),
+            text_file=portable_output_path(destination/'ocr.txt') if (destination/'ocr.txt').is_file() else '',
+            image_urls_file=portable_output_path(destination/'image_urls.txt'), image_count=len(pages),
+            character_count=int(metadata.get('character_count', 0)), status='ok',
+            images_dir=portable_output_path(destination/'images') if (destination/'images').is_dir() else '',
+            archive_file=portable_output_path(archive) if archive.is_file() else '')
+    # Hidden staging is retained after interruption and never enumerated as Ready.
+    import hashlib
+    chapter_dir = output_dir / ('.receiving-' + destination.name + '-' + hashlib.sha256(chapter_source_url.encode()).hexdigest()[:16])
+    if chapter_dir.is_symlink():
+        raise ValueError('Capture staging must not be a symbolic link.')
     chapter_dir.mkdir(parents=True, exist_ok=True)
 
     if not wait_for_chapter_media(driver, image_selector):
@@ -1754,19 +1876,24 @@ def ocr_current_chapter(
 
     if saved and not save_raw_images:
         shutil.rmtree(images_dir)
+    # Remove only this app-owned retry cache after the archive has been prepared.
+    # Partial caches stay hidden after interruption; they are never library pages.
+    retry_cache = chapter_dir / '.http-pages'
+    if retry_cache.is_dir() and not retry_cache.is_symlink():
+        shutil.rmtree(retry_cache)
 
     metadata = {
         "index": chapter_index,
         "series_title": series_title,
         "series_slug": series_slug,
         "series_dir": portable_output_path(output_dir),
-        "chapter_folder": chapter_dir.name,
+        "chapter_folder": destination.name,
         "url": chapter_source_url,
         "title": title,
         "image_count": len(image_urls),
         "saved_image_count": saved,
-        "images_dir": portable_output_path(images_dir) if saved and save_raw_images else "",
-        "archive_file": portable_output_path(archive_file),
+        "images_dir": portable_output_path(destination/'images') if saved and save_raw_images else "",
+        "archive_file": portable_output_path(destination/archive_file.name) if archive_file else "",
         "character_count": len(text),
         "saved_at_epoch": int(time.time()),
         "reader_layout": reader_layout,
@@ -1774,6 +1901,22 @@ def ocr_current_chapter(
         "segment_max_y": segment_max_y or 0,
     }
     (chapter_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    from panelyra.services.library_store import LibraryStore, decode_image, validate_archive
+    if archive_file:
+        validate_archive(archive_file)
+    elif saved:
+        for image in images_dir.iterdir():
+            decode_image(image.read_bytes())
+    managed_root = output_dir.parent.parent
+    if saved and output_dir.parent.name in {'manhwa','manhwa_clean'}:
+        LibraryStore(managed_root).publish(chapter_dir, destination)
+    else:
+        os.rename(chapter_dir, destination)
+    image_urls_file = destination/image_urls_file.name
+    images_dir = destination/'images'
+    if archive_file: archive_file = destination/archive_file.name
+    if text_file: text_file = destination/text_file.name
 
     return ChapterDownload(
         index=chapter_index,
@@ -1797,7 +1940,7 @@ def open_capture_driver(
     session = bot.build_driver(
         chrome_profile_dir=chrome_profile_dir,
         remote_debugging_port=DOWNLOAD_DEBUG_PORT,
-        browser_lock_path=DOWNLOAD_BROWSER_LOCK,
+        browser_lock_path=__import__('automation_runtime').BROWSER_LOCK_PATH,
     )
     if bot.load_url_with_retries(session.driver, url, label):
         return session
@@ -1852,13 +1995,24 @@ def download_manhwa_ocr(
     defer_ocr = bool(save_ocr and save_raw_images and max_chapters > 1)
     ocr_executor = ThreadPoolExecutor(max_workers=1) if defer_ocr else None
     pending_ocr: list[tuple[int, object, Path]] = []
+    # Local OCR is serialized per chapter, never an unbounded executor backlog.
+    if ocr_executor is not None:
+        ocr_executor.shutdown(wait=False)
+        ocr_executor = None
+    defer_ocr = False
+    checkpoint = reporter.capture.resume(reporter.record.run_id) if reporter and reporter.capture else {}
+    first_index = max(1, int(checkpoint.get('chapter_index', 1)))
+    completed_count = first_index - 1
+    if checkpoint.get('approved'):
+        current_url = str(checkpoint.get('url') or start_url)
+        start_signal_file = None
 
     try:
         if reporter:
             reporter.update(status="running", stage="opening-browser", progress_total=max_chapters)
         driver_session = open_capture_driver(
             chrome_profile_dir,
-            start_url,
+            current_url,
             "OCR start page",
         )
         driver = driver_session.driver
@@ -1933,9 +2087,12 @@ def download_manhwa_ocr(
         bot.dismiss_page_interruptions(driver)
         current_url = maybe_open_capture_chapter(driver, driver.current_url, image_selector)
         current_url = driver.current_url
+        if reporter and reporter.capture:
+            reporter.capture.checkpoint(reporter.record.run_id, 'approved',
+                                        {'approved': True, 'url': current_url, 'chapter_index': first_index})
         series_title = series_title_from_page(driver)
         series_slug = slugify(series_title, "manhwa")
-        series_output_dir = resolve_series_output_dir(output_dir, series_title, series_slug)
+        series_output_dir = resolve_series_output_dir(output_dir, series_title, series_slug, source_url=current_url)
         manifest = series_output_dir / "manifest.json"
         if manifest.exists():
             try:
@@ -1953,8 +2110,13 @@ def download_manhwa_ocr(
             except (OSError, json.JSONDecodeError):
                 logging.warning("Existing series manifest could not be read; starting a fresh manifest.")
         logging.info("Series output folder: %s", series_output_dir)
-        segment_min_y = 0
-        for chapter_index in range(1, max_chapters + 1):
+        segment_min_y = int(checkpoint.get('segment_min_y', 0))
+        for chapter_index in range(first_index, max_chapters + 1):
+            # Release browser memory/profile ownership at bounded chapter intervals.
+            if chapter_index > first_index and (chapter_index - first_index) % 20 == 0 and segment_min_y == 0:
+                bot.close_driver_session(driver_session)
+                driver_session = open_capture_driver(chrome_profile_dir, current_url, 'Capture chunk resume')
+                driver = driver_session.driver
             effective_layout = reader_layout if reader_layout != "auto" else "next-chapter"
             logging.info(
                 "OCR downloading chapter %s/%s: %s",
@@ -1967,6 +2129,7 @@ def download_manhwa_ocr(
                     "scanning",
                     chapter_index=chapter_index,
                     url=safe_driver_url(driver, current_url or start_url),
+                    segment_min_y=segment_min_y,
                     message=f"Scanning chapter {chapter_index}/{max_chapters}",
                 )
             processed_chapter_url = current_url or start_url
@@ -1997,6 +2160,16 @@ def download_manhwa_ocr(
                     effective_layout != "continuous"
                     and bot.canonical_chapter_key(driver.current_url) in completed_urls
                 ):
+                    from panelyra.services.library_store import validate_archive, decode_image
+                    prior = next(item for item in manifest_records if capture_result_key(str(item.get('url', ''))) == capture_result_key(driver.current_url))
+                    if prior.get('archive_file'):
+                        validate_archive(local_output_path(str(prior['archive_file'])))
+                    else:
+                        pages = ordered_archive_images(local_output_path(str(prior.get('images_dir', ''))))
+                        if not pages or len(pages) != int(prior.get('image_count', 0)):
+                            raise ValueError('Previously captured chapter is incomplete; retained for review.')
+                        for page in pages:
+                            decode_image(page.read_bytes())
                     logging.info("Resume mode skipped completed chapter: %s", driver.current_url)
                 else:
                     result = ocr_current_chapter(
@@ -2045,8 +2218,12 @@ def download_manhwa_ocr(
                     ]
                     manifest_records.append(result_record)
                     atomic_write_json(manifest, manifest_records)
-                    if reporter:
-                        reporter.update(progress_current=chapter_index, message=f"Completed chapter {chapter_index}")
+                completed_count += 1
+                if reporter:
+                    reporter.update(progress_current=completed_count, message=f"Completed chapter {chapter_index}")
+                    if reporter.capture:
+                        reporter.capture.checkpoint(reporter.record.run_id, 'ready',
+                            {'chapter_index': chapter_index, 'url': processed_chapter_url})
             except Exception as exc:
                 logging.exception("Chapter %s OCR download failed: %s", chapter_index, exc)
                 results.append(
@@ -2081,7 +2258,9 @@ def download_manhwa_ocr(
                     current_url = driver.current_url
                     segment_min_y = 0
                     logging.info("Browser recovery succeeded; continuing the Capture run.")
-                    continue
+                # Keep this exact chapter as the first unfinished item. Explicit
+                # Retry may recover the browser, but never silently skip the failure.
+                break
 
             if chapter_index >= max_chapters:
                 break
@@ -2098,6 +2277,9 @@ def download_manhwa_ocr(
                     if next_boundary is not None:
                         segment_min_y = current_boundary + 1
                         current_url = driver.current_url
+                        if reporter:
+                            reporter.checkpoint('scanning', chapter_index=chapter_index + 1,
+                                                url=current_url, segment_min_y=segment_min_y)
                         logging.info(
                             "Continuous Capture advancing within the same URL to chapter segment %s.",
                             chapter_index + 1,
@@ -2122,6 +2304,9 @@ def download_manhwa_ocr(
                 driver, current_url, f"OCR chapter {chapter_index + 1}"
             ):
                 break
+            if reporter:
+                reporter.checkpoint('scanning', chapter_index=chapter_index + 1,
+                                    url=current_url, segment_min_y=0)
 
         if pending_ocr:
             if driver_session is not None:
@@ -2181,11 +2366,14 @@ def download_manhwa_ocr(
                 message=failure_reason,
             )
         elif reporter:
-            reporter.update(status="completed", stage="completed", progress_current=len(results))
+            reporter.update(status="completed" if completed_count == max_chapters else 'failed',
+                            stage="completed" if completed_count == max_chapters else 'partial',
+                            progress_current=completed_count)
         return results
     except Exception as exc:
         if reporter:
-            reporter.update(status="failed", stage="failed", stop_reason=str(exc))
+            reason = friendly_browser_error(exc)
+            reporter.update(status="failed", stage="failed", stop_reason=reason, message=reason)
         raise
     finally:
         if ocr_executor is not None:

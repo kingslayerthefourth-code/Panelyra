@@ -34,5 +34,40 @@ research_context.json
 
 # OS/editor files
 .DS_Store
+android/.gradle/
+android/local.properties
+android/**/build/
+data/tablet_companion/
 .idea/
 .vscode/
+
+# Organized local data and archived copies
+data/history/
+data/updates/
+archive/
+!config/examples/.env.example
+# Optional external releases and user download staging (never source-controlled).
+/vendor/manga-downloader/
+/data/manga_backend/
+/data/foundation.sqlite3*
+/data/engine/
+/data/artifacts/
+/data/page_cache/
+*.keystore
+*.jks
+
+# Private client state, local SDK tools, and generated release artifacts.
+/config/lyra_conversations.json
+/data/*.json
+/data/reader_covers/
+/data/delivery/
+/validation/
+/tools/
+/releases/*
+!/releases/*-README.md
+*.pem
+*.key
+*.p12
+# Deliberately public, throwaway TLS identity used only by local fixture tests.
+!/android/app/src/test/resources/receive-test.p12
+/android/app/src/main/assets/library-cleanup.json

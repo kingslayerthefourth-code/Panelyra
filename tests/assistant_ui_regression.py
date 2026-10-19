@@ -1,46 +1,17 @@
-#!/usr/bin/env python3
-"""Streamlit regression for Copilot conversation, evidence, and actions."""
-
-from __future__ import annotations
-
-import sys
+"""AI retirement: no navigation, controls or model requests; old routes remain safe."""
 from pathlib import Path
-
+from unittest.mock import patch
+import sys
+ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
 from streamlit.testing.v1 import AppTest
-
-APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
-sys.path.insert(0, str(APP_PATH.parent))
-
-
-def main() -> int:
-    app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
-    app.session_state["page"] = "Assistant"
-    app.session_state["assistant_use_model"] = False
-    app.run()
-    assert not app.exception
-    assert app.radio
-    assert app.radio[0].label == "Assistant mode"
-    assert "Diagnose" in app.radio[0].options
-    assert app.chat_input
-
-    app.radio[0].set_value("Diagnose").run()
-    app.chat_input[0].set_value("Why did the latest Capture run fail?").run()
-    assert not app.exception
-    messages = list(app.session_state["assistant_messages"])
-    assert messages[-1]["role"] == "assistant"
-    assert messages[-1]["mode"] == "Diagnose"
-    assert messages[-1]["evidence"]
-    assert any(action["kind"] == "prepare_retry" for action in messages[-1]["actions"])
-
-    buttons = {button.label: button for button in app.button}
-    assert "Open Capture Live" in buttons
-    buttons["Open Capture Live"].click().run()
-    assert app.session_state["page"] == "Capture"
-    assert app.session_state["capture_view"] == "Live"
-
-    print("Assistant UI regression checks passed.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+with patch("panelyra.assistant.local_model.LocalModelClient.status", side_effect=AssertionError("Model must not be contacted")), patch("panelyra.services.preferences.save_preferences"):
+    app=AppTest.from_file(str(ROOT/"app.py"),default_timeout=45).run()
+    for route in ["Library","Lyra","Assistant","Settings","Capture Live","Engage Live","Run History"]:
+        app.session_state["page"]=route
+        app.run()
+        assert not app.exception, app.exception
+        assert not app.chat_input
+        assert not any("Lyra" in b.label or b.label == "AI" for b in app.button)
+        assert not app.session_state["show_lyra_in_immersive_reader"]
+    assert "Lyra" not in [b.label for b in app.sidebar.button]
+print("AI removal: routes, reader toggle, actions and no model calls passed")

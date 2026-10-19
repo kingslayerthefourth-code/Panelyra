@@ -1,99 +1,27 @@
-#!/usr/bin/env python3
-"""Regression coverage for Panelyra navigation and sequential workspaces."""
-
-from __future__ import annotations
-
-from pathlib import Path
 import sys
-
+from pathlib import Path
+from unittest.mock import patch
+ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
 from streamlit.testing.v1 import AppTest
-
-
-APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
-sys.path.insert(0, str(APP_PATH.parent))
-
-
-def button_map(app: AppTest) -> dict[str, object]:
-    return {button.label: button for button in app.button}
-
-
-def assert_ready(app: AppTest, page: str) -> None:
-    assert not app.exception, f"{page} raised a Streamlit exception: {app.exception}"
-    rendered = "\n".join(str(block.value) for block in app.markdown)
-    assert "Panelyra" in rendered, f"{page} did not render Panelyra branding"
-    repeated_warnings = {
-        "I own, administer, or have permission to use this target",
-        "I have permission to archive this target",
-        "I own, administer, or have permission to use this editor",
-    }
-    labels = {checkbox.label for checkbox in app.checkbox}
-    assert not labels.intersection(repeated_warnings), f"{page} repeated the onboarding acknowledgment"
-
-
-def open_workspace(app: AppTest, dashboard_label: str) -> None:
-    buttons = button_map(app)
-    assert dashboard_label in buttons
-    buttons[dashboard_label].click().run()
-    assert_ready(app, dashboard_label)
-
-
-def main() -> int:
-    # Cold imports include OCR and browser integration modules on local machines.
-    app = AppTest.from_file(str(APP_PATH), default_timeout=45).run()
-    assert_ready(app, "Dashboard")
-
-    for label in ("Start Comment Testing", "Start Chapter Capture", "Start Creative Studio"):
-        assert label in button_map(app), f"Dashboard is missing {label}"
-
-    open_workspace(app, "Start Comment Testing")
-    assert "Continue to behavior" in button_map(app)
-    app.session_state["start_url"] = "http://127.0.0.1:8766/content/example/chapter-1"
-    app.session_state["authorization_confirmed"] = True
-    app.run()
-    button_map(app)["Continue to behavior"].click().run()
-    assert "Continue to review" in button_map(app)
-    button_map(app)["Continue to review"].click().run()
-    assert "Open browser and prepare" in button_map(app)
-    assert "Start exact URL" in button_map(app)
-    assert_ready(app, "Engage review")
-
-    app.session_state["page"] = "Dashboard"
-    app.run()
-    open_workspace(app, "Start Chapter Capture")
-    capture_url = (
-        "https://en-thunderscans.com/"
-        "since-im-immune-to-corruption-i-start-with-a-disaster-class-demon-sword-chapter-1/"
-    )
-    app.text_input(key="ocr_start_url").set_value(capture_url).run()
-    assert "Continue to output" in button_map(app)
-    button_map(app)["Continue to output"].click().run()
-    assert "Continue to review" in button_map(app)
-    button_map(app)["Continue to review"].click().run()
-    assert app.session_state["ocr_start_url"] == capture_url
-    assert "Start Capture" in button_map(app)
-    assert not button_map(app)["Start Capture"].disabled
-    assert_ready(app, "Capture review")
-
-    app.session_state["page"] = "Dashboard"
-    app.run()
-    open_workspace(app, "Start Creative Studio")
-    assert "Continue to design" in button_map(app)
-    assert_ready(app, "Studio source")
-
-    for page in ("Reader", "Assistant", "Run History", "Settings", "Help"):
-        app.session_state["page"] = page
-        app.run()
-        assert_ready(app, page)
-        if page == "Reader":
-            assert app.selectbox, "Reader did not provide a series selector"
-        if page == "Assistant":
-            assert app.radio
-            assert app.radio[0].label == "Assistant mode"
-            assert app.chat_input
-
-    print("Dashboard and workspace readiness checks passed.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# Don't overwrite real preferences while exercising routing/drafts.
+with patch('panelyra.services.preferences.save_preferences'):
+    app=AppTest.from_file(str(ROOT/'app.py'),default_timeout=60).run()
+    def ready(label):
+        assert not app.exception, (label,[(x.message,x.stack_trace) for x in app.exception])
+        print(label, 'OK', flush=True)
+    ready('Cold start')
+    assert [b.label for b in app.sidebar.button]==['Library','Downloads','Capture','Engage','Activity','Settings']
+    for page in ['Library','Downloads','Capture','Engage','Activity','Settings']:
+        app.button(key='nav_'+page).click().run();ready(page)
+        if page=='Capture':
+            assert app.button(key='capture_start')
+            assert all('Continue to' not in b.label for b in app.button)
+        if page=='Settings':
+            for view in ['Connections','Storage','Help','General']:
+                app.session_state['settings_view']=view;app.run();ready('Settings '+view)
+    for legacy,expected in [('Reader','Library'),('Dashboard','Library'),('Capture Library','Library'),('Studio','Library'),('Studio Live','Library'),('Run History','Activity'),('Assistant','Library'),('Lyra','Library'),('Help','Settings')]:
+        app.session_state['page']=legacy;app.run();ready('Migrate '+legacy)
+        assert app.session_state['page']==expected
+    for page in ['Capture Live','Engage Live','Engage Insights']:
+        app.session_state['page']=page;app.run();ready(page)
+print('All routes passed')

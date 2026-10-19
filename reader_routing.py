@@ -322,7 +322,16 @@ def _click_control(
             copy.hash = "";
             return (copy.origin + copy.pathname.replace(/\\/$/, "") + "?" + copy.searchParams).replace(/\\?$/, "");
         };
+        const chapterNumber = value => {
+            const matches = String(value || "").matchAll(
+                /(?:chapter|chap|ch|episode|ep)[-_/.:\\s]*(\\d+(?:\\.\\d+)?)/gi
+            );
+            let number = null;
+            for (const match of matches) number = Number(match[1]);
+            return Number.isFinite(number) ? number : null;
+        };
         const currentUrl = new URL(location.href);
+        const currentChapter = chapterNumber(document.title + " " + location.href);
         const pageHref = node => {
             const target = href(node), targetPage = pageValue(target);
             return target && targetPage !== null && targetPage !== pageValue(currentUrl)
@@ -345,6 +354,13 @@ def _click_control(
                     || (safeAll(selector).includes(node) && !chapterHref(node));
             }
             if (/prev|previous|back/.test(text)) return false;
+            const target = href(node);
+            const targetChapter = chapterNumber(text + " " + (target ? target.href : ""));
+            if (currentChapter !== null) {
+                if (targetChapter !== null && targetChapter <= currentChapter) return false;
+                if (targetChapter === null
+                    && !/next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(text)) return false;
+            }
             return /next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(text)
                 || chapterHref(node)
                 || (safeAll(selector).includes(node) && !pageHref(node));
@@ -369,6 +385,13 @@ def _click_control(
         if (!candidates.length) return false;
         candidates.sort((a, b) => {
             const aText = label(a), bText = label(b);
+            const aTarget = href(a), bTarget = href(b);
+            const aChapter = chapterNumber(aText + " " + (aTarget ? aTarget.href : ""));
+            const bChapter = chapterNumber(bText + " " + (bTarget ? bTarget.href : ""));
+            if (kind === "chapter" && currentChapter !== null
+                && aChapter !== null && bChapter !== null && aChapter !== bChapter) {
+                return aChapter - bChapter;
+            }
             const aScore = kind === "chapter"
                 ? (/next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(aText) ? 100 : 0)
                 : (/next\\s+page|page\\s+next/.test(aText) ? 100 : 0);
@@ -445,13 +468,37 @@ def next_chapter_href(driver: object, selectors: ReaderSelectors) -> str:
                 );
             } catch (_) { return false; }
         };
+        const chapterNumber = value => {
+            const matches = String(value || "").matchAll(
+                /(?:chapter|chap|ch|episode|ep)[-_/.:\\s]*(\\d+(?:\\.\\d+)?)/gi
+            );
+            let number = null;
+            for (const match of matches) number = Number(match[1]);
+            return Number.isFinite(number) ? number : null;
+        };
+        const currentNumber = chapterNumber(document.title + " " + location.href);
         const configured = safeAll(selector);
         const semantic = safeAll("a[href],button,[role='button']").filter(node =>
             /next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(label(node))
                 || chapterHref(node)
         );
-        const candidates = Array.from(new Set([...semantic, ...configured])).filter(visible);
+        let candidates = Array.from(new Set([...semantic, ...configured])).filter(visible);
+        if (currentNumber !== null) {
+            candidates = candidates.filter(node => {
+                const targetNumber = chapterNumber(
+                    [node.innerText || "", node.textContent || "", node.href || node.getAttribute("data-href") || ""].join(" ")
+                );
+                if (targetNumber !== null) return targetNumber > currentNumber;
+                return /next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(label(node));
+            });
+        }
         candidates.sort((a, b) => {
+            const aNumber = chapterNumber([a.innerText || "", a.href || ""].join(" "));
+            const bNumber = chapterNumber([b.innerText || "", b.href || ""].join(" "));
+            if (currentNumber !== null && aNumber !== null && bNumber !== null) {
+                const distance = (aNumber - currentNumber) - (bNumber - currentNumber);
+                if (distance) return distance;
+            }
             const aScore = /next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(label(a)) ? 100 : 0;
             const bScore = /next\\s+(chapter|episode)|(chapter|episode)\\s+next/.test(label(b)) ? 100 : 0;
             return bScore - aScore;
@@ -544,4 +591,6 @@ def next_chapter_from_visible_list(
         later = sorted(item for item in parsed if item[0] > current_number)
         if later:
             return later[0][1]
+        if parsed:
+            return None
     return ordered[0] if ordered else None

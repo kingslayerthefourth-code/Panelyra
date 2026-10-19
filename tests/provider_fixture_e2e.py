@@ -28,7 +28,7 @@ from history_utils import read_jsonl_records
 
 
 BOT = APP_DIR / "bot.py"
-REPORT_DIR = APP_DIR / "test_reports"
+REPORT_DIR = APP_DIR / "outputs/test-reports"
 DEFAULT_REPORT_PATH = REPORT_DIR / "panelyra_provider_e2e_report.json"
 
 

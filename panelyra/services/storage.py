@@ -31,7 +31,7 @@ STORAGE_AREAS = (
     StorageArea("studio", "Studio renders", UPLOADS_DIR, False, "Uploaded source images and generated Word Art."),
     StorageArea("runs", "Run records", RUNS_DIR, True, "Process records and checkpoints."),
     StorageArea("logs", "Temporary logs", PANELYRA_LOG_DIR, True, "Bounded automation console logs."),
-    StorageArea("reports", "Test reports", PROJECT_ROOT / "test_reports", True, "Generated regression reports."),
+    StorageArea("reports", "Test reports", PROJECT_ROOT / "outputs/test-reports", True, "Generated regression reports."),
     StorageArea("legacy_ocr", "Legacy OCR output", LEGACY_DOWNLOAD_DIR, False, "Older output retained for compatibility."),
 )
 

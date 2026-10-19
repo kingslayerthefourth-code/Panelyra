@@ -1,4 +1,4 @@
-selenium>=4.21.0
+selenium>=4.21.0,<4.27
 webdriver-manager>=4.0.1
 streamlit>=1.36.0
 websocket-client>=1.8.0
@@ -7,3 +7,4 @@ requests>=2.31.0
 Pillow>=10.0.0
 easyocr>=1.7.1
 urllib3<2
+qrcode[pil]>=7.4.2,<9

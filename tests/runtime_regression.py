@@ -12,6 +12,7 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_DIR))
 
+import bot
 from automation_runtime import (
     BrowserBusyError,
     RunRecord,
@@ -33,6 +34,15 @@ def hold_browser_lock(lock_path: Path, ready: multiprocessing.Event, release: mu
 
 
 def main() -> int:
+    assert bot.is_promotional_chapter_image_url(
+        "https://pagead2.googlesyndication.com/pagead/imgad?id=fixture"
+    )
+    assert bot.is_promotional_chapter_image_url(
+        "https://cdn.test/placements/sponsored-banner.webp"
+    )
+    assert not bot.is_promotional_chapter_image_url(
+        "https://static.reader.test/chapters/chapter-id/001.webp"
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
         lock_path = root / "browser.lock"

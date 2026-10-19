@@ -115,6 +115,17 @@ MANHWA_IMAGE_SELECTOR = (
     "img[data-lazy-src], img[data-original], img[src], img"
 )
 OCR_CONFIDENCE = 0.45
+PROMOTIONAL_IMAGE_PATTERN = re.compile(
+    r"discord|telegram|scanlation|credit|advert|promo|patreon|donat|logo|avatar|favicon|banner|"
+    r"(?:^|[-_.])ads?(?:[-_.]|$)|sponsor|campaign|monetiz|native[-_.]?ad",
+    re.IGNORECASE,
+)
+AD_IMAGE_HOST_PATTERN = re.compile(
+    r"(?:^|\.)(?:doubleclick\.net|googlesyndication\.com|googleadservices\.com|"
+    r"adservice\.google\.com|amazon-adsystem\.com|adnxs\.com|taboola\.com|"
+    r"outbrain\.com|criteo\.com|pubmatic\.com|rubiconproject\.com)$",
+    re.IGNORECASE,
+)
 
 # Optional. Leave blank if the app does not show a predictable confirmation node.
 CONFIRMATION_SELECTOR = ".comment-success, .notice-success, .toast-success, [data-testid='comment-success']"
@@ -137,8 +148,32 @@ TYPE_MAX_DELAY = 0.22
 COOLDOWN_MIN_SECONDS = 5
 COOLDOWN_MAX_SECONDS = 10
 KEEP_BROWSER_OPEN_ON_EXIT = False
-COMMENT_HISTORY_PATH = Path(__file__).resolve().parent / "comment_history.jsonl"
-READ_MARKERS_PATH = Path(__file__).resolve().parent / "read_markers.jsonl"
+LOST_DRIVER_MESSAGES = (
+    "no such window",
+    "target window already closed",
+    "web view not found",
+    "invalid session id",
+    "disconnected",
+    "chrome not reachable",
+)
+
+
+def driver_session_lost(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return isinstance(exc, WebDriverException) and any(
+        fragment in message for fragment in LOST_DRIVER_MESSAGES
+    )
+
+
+def friendly_browser_error(exc: BaseException) -> str:
+    if driver_session_lost(exc):
+        return (
+            "Chrome was closed or disconnected during the run. Completed work is safe. "
+            "Open the workflow review, confirm the target page, and retry to continue."
+        )
+    return str(exc)
+COMMENT_HISTORY_PATH = Path(__file__).resolve().parent / "data/history/comment_history.jsonl"
+READ_MARKERS_PATH = Path(__file__).resolve().parent / "data/history/read_markers.jsonl"
 RESEARCH_CONTEXT_PATH = Path(__file__).resolve().parent / "research_context.json"
 
 
@@ -146,7 +181,7 @@ OPENING_REMARKS = [
     "Wow",
     "Honestly",
     "Just caught up with this",
-    "This chapter really landed",
+    "That scene really landed",
     "I was not expecting that",
     "Had to reread this section",
     "The update was worth the wait",
@@ -170,13 +205,13 @@ SUBJECT_PHRASES = [
 
 ENDING_PHRASES = [
     "can't wait for the next drop",
-    "this chapter was a strong one",
+    "that was a strong moment",
     "that caught me completely off guard",
     "I need to see where this goes next",
     "this one is definitely memorable",
     "the ending really sticks",
     "the payoff here was worth it",
-    "the next chapter should be interesting",
+    "what comes next should be interesting",
     "this was a great read",
     "I am curious how the next part opens",
 ]
@@ -242,6 +277,7 @@ NOISY_KEYWORDS = {
     "albex",
     "banner",
     "banners",
+    "bilibili",
     "bedsidecanoe",
     "calsed",
     "chapter",
@@ -254,7 +290,12 @@ NOISY_KEYWORDS = {
     "cookies",
     "diei",
     "discord",
+    "donation",
+    "donations",
+    "editor",
+    "editing",
     "embed",
+    "fastest",
     "first",
     "firs",
     "gtrash",
@@ -271,6 +312,12 @@ NOISY_KEYWORDS = {
     "less",
     "lristensei",
     "mangatod",
+    "manga",
+    "manhua",
+    "manhwa",
+    "meraki",
+    "merakiscans",
+    "methods",
     "notes",
     "olherreaders",
     "page",
@@ -293,6 +340,8 @@ NOISY_KEYWORDS = {
     "reread",
     "rimzthbone",
     "repost",
+    "release",
+    "releases",
     "right",
     "scan",
     "scans",
@@ -301,6 +350,7 @@ NOISY_KEYWORDS = {
     "sconlations",
     "send",
     "server",
+    "series",
     "site",
     "skyroy",
     "stabi",
@@ -319,10 +369,14 @@ NOISY_KEYWORDS = {
     "trash",
     "trashscanlations",
     "translator",
+    "translated",
+    "translation",
     "unable",
     "upload",
+    "updates",
     "vyncuy",
     "website",
+    "webtoon",
     "zerccies",
 }
 COMMENT_BANNED_WORDS = {
@@ -365,7 +419,7 @@ NEUTRAL_COMMENT_ANCHORS = [
     "buildup",
     "small reaction",
     "main turn",
-    "chapter flow",
+    "scene flow",
 ]
 REFLECTION_TEMPLATES = [
     lambda keyword: f"Kind of reminds me of Socrates saying the unexamined life is not worth living; {keyword} feels like the thing this chapter wants us to examine.",
@@ -1409,6 +1463,15 @@ def current_comment_editor_y(driver: WebDriver) -> Optional[int]:
     return value or None
 
 
+def is_promotional_chapter_image_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    asset_hint = f"{parsed.path.rsplit('/', 2)[-1]} {parsed.query}"
+    return bool(
+        AD_IMAGE_HOST_PATTERN.search(parsed.hostname or "")
+        or PROMOTIONAL_IMAGE_PATTERN.search(asset_hint)
+    )
+
+
 def visible_chapter_image_urls(driver: WebDriver, img_selector: str, min_y: int, max_y: int) -> list[str]:
     driver.switch_to.default_content()
     script = """
@@ -1446,14 +1509,39 @@ def visible_chapter_image_urls(driver: WebDriver, img_selector: str, min_y: int,
         const visible = (node) => {
             const rect = node.getBoundingClientRect();
             const style = window.getComputedStyle(node);
-            return rect.width >= 180
-                && rect.height >= 180
+            return rect.width > 0
+                && rect.height > 0
                 && style.visibility !== "hidden"
                 && style.display !== "none";
         };
+        const inAdContext = (node) => {
+            let current = node;
+            for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+                const marker = [
+                    current.id || "", String(current.className || ""),
+                    current.getAttribute?.("data-ad") || "",
+                    current.getAttribute?.("data-ad-slot") || "",
+                    current.getAttribute?.("data-ad-unit") || "",
+                    current.getAttribute?.("data-testid") || "",
+                    current.getAttribute?.("aria-label") || ""
+                ].join(" ").toLowerCase();
+                if (
+                    /(?:^|[\\s_-])(?:ad|ads|advert|advertisement|sponsor|sponsored|promo|promoted)(?:$|[\\s_-])/.test(marker)
+                    || /adsbygoogle|ad-container|ad-wrapper|ad-slot|ad-unit|native-ad|commercial/.test(marker)
+                ) return true;
+            }
+            return false;
+        };
+        const panelGeometry = (img, rect) => {
+            const width = Math.max(Number(img.naturalWidth || 0), rect.width);
+            const height = Math.max(Number(img.naturalHeight || 0), rect.height);
+            return width >= 180 && height >= 260 && height >= width * 0.52;
+        };
         return Array.from(document.querySelectorAll(selector)).filter((img) => {
             if (!visible(img)) return false;
+            if (inAdContext(img)) return false;
             const rect = img.getBoundingClientRect();
+            if (!panelGeometry(img, rect)) return false;
             const top = rect.top + window.scrollY;
             const bottom = top + rect.height;
             return bottom >= minY && top <= maxY;
@@ -1467,7 +1555,7 @@ def visible_chapter_image_urls(driver: WebDriver, img_selector: str, min_y: int,
     urls: list[str] = []
     for raw_url in raw_urls or []:
         url = str(raw_url).strip()
-        if url and url not in urls:
+        if url and not is_promotional_chapter_image_url(url) and url not in urls:
             urls.append(url)
     return urls
 
@@ -1506,8 +1594,33 @@ def loaded_chapter_image_urls(driver: WebDriver, img_selector: str, min_y: int, 
             ];
             return attrs.find((value) => value && !value.startsWith("data:")) || "";
         };
+        const inAdContext = (node) => {
+            let current = node;
+            for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+                const marker = [
+                    current.id || "", String(current.className || ""),
+                    current.getAttribute?.("data-ad") || "",
+                    current.getAttribute?.("data-ad-slot") || "",
+                    current.getAttribute?.("data-ad-unit") || "",
+                    current.getAttribute?.("data-testid") || "",
+                    current.getAttribute?.("aria-label") || ""
+                ].join(" ").toLowerCase();
+                if (
+                    /(?:^|[\\s_-])(?:ad|ads|advert|advertisement|sponsor|sponsored|promo|promoted)(?:$|[\\s_-])/.test(marker)
+                    || /adsbygoogle|ad-container|ad-wrapper|ad-slot|ad-unit|native-ad|commercial/.test(marker)
+                ) return true;
+            }
+            return false;
+        };
+        const panelGeometry = (img, rect) => {
+            const width = Math.max(Number(img.naturalWidth || 0), rect.width);
+            const height = Math.max(Number(img.naturalHeight || 0), rect.height);
+            return width >= 180 && height >= 260 && height >= width * 0.52;
+        };
         return Array.from(document.querySelectorAll(selector)).filter((img) => {
+            if (inAdContext(img)) return false;
             const rect = img.getBoundingClientRect();
+            if (!panelGeometry(img, rect)) return false;
             const top = rect.top + window.scrollY;
             const height = rect.height || img.naturalHeight || img.height || 0;
             const bottom = top + height;
@@ -1523,7 +1636,7 @@ def loaded_chapter_image_urls(driver: WebDriver, img_selector: str, min_y: int, 
     urls: list[str] = []
     for raw_url in raw_urls or []:
         url = str(raw_url).strip()
-        if url and url not in urls:
+        if url and not is_promotional_chapter_image_url(url) and url not in urls:
             urls.append(url)
     return urls
 
@@ -1833,8 +1946,10 @@ NON_STORY_CONTEXT_PATTERNS = [
     for pattern in (
         r"\bdiscord\b",
         r"\bscanlation(s)?\b",
-        r"\bscans?\b",
+        r"\b[a-z0-9_-]*scans?\b",
         r"\basura\s*scans?\b",
+        r"\bmeraki\b|\bbilibili\b|\bwebtoon\b",
+        r"\bfastest\s+updates?\b|\bdonation\s+methods?\b|\brelease\s+announcement(s)?\b",
         r"\bjoin\s+(our|the)\b",
         r"\bsupport\s+(us|the\s+team)\b",
         r"\bpatreon\b|\bko-?fi\b|\bdonate\b",
@@ -1878,6 +1993,25 @@ def remove_comment_cliches(text: str) -> str:
         flags=re.IGNORECASE,
     )
     rewritten = re.sub(r"\bangle\b", "part", rewritten, flags=re.IGNORECASE)
+    return normalize_space(rewritten)
+
+
+def remove_chapter_meta_language(text: str) -> str:
+    """Keep comments about the story rather than describing the container page."""
+    substitutions = (
+        (r"\ba few chapters from now\b", "later on"),
+        (r"\b(?:in|for) the next chapter\b", "in what comes next"),
+        (r"\bthe next chapter\b", "what comes next"),
+        (r"\bnext chapter\b", "what comes next"),
+        (r"\bthis chapter\b", "this part"),
+        (r"\bthe chapter\b", "the story"),
+        (r"\ba chapter\b", "a scene"),
+        (r"\bchapters\b", "later parts"),
+        (r"\bchapter\b", "story"),
+    )
+    rewritten = text
+    for pattern, replacement in substitutions:
+        rewritten = re.sub(pattern, replacement, rewritten, flags=re.IGNORECASE)
     return normalize_space(rewritten)
 
 
@@ -2078,13 +2212,17 @@ def looks_like_ocr_garbage(word: str) -> bool:
         return True
     if re.search(r"(.)\1{3,}", word):
         return True
-    if len(word) >= 10:
+    if len(word) >= 5:
         vowels = sum(1 for char in word if char in "aeiou")
-        if vowels / max(1, len(word)) < 0.22:
+        if vowels / max(1, len(word)) < 0.20:
             return True
     if re.search(r"[bcdfghjklmnpqrstvwxyz]{5,}", word):
         return True
-    if any(noise in word for noise in ("trash", "scanlation", "discord", "patreon", "paypal", "readire", "advert", "sponsor", "promo")):
+    if any(noise in word for noise in (
+        "trash", "scanlation", "scans", "discord", "patreon", "paypal", "readire",
+        "advert", "sponsor", "promo", "meraki", "bilibili", "webtoon", "donation",
+        "translator", "translated", "typesetter",
+    )):
         return True
     return False
 
@@ -2324,7 +2462,10 @@ def context_story_terms(context: ChapterContext) -> list[str]:
         for term in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", context.title)
         if normalize_keyword(term) not in {"chapter", "episode", "volume", "vol"}
     ]
-    candidates = [*context.keywords, *title_terms]
+    # OCR/body terms are more reliable than browser titles, which often contain
+    # the host name, release metadata, or reader UI text.
+    body_terms = [term for term in context.keywords if keyword_is_comment_anchor(term)]
+    candidates = [*body_terms, *(title_terms if len(body_terms) < 2 else [])]
     return list(
         dict.fromkeys(
             normalize_keyword(term)
@@ -2486,7 +2627,6 @@ def maybe_add_casual_grammar_imperfection(text: str) -> str:
         (r"\bI am\b", "I"),
         (r"\bit is\b", "it"),
         (r"\bIt is\b", "It"),
-        (r"\bThis chapter\b", "This chapter it"),
     ]
     random.shuffle(replacements)
     for pattern, replacement in replacements:
@@ -2497,14 +2637,14 @@ def maybe_add_casual_grammar_imperfection(text: str) -> str:
 
 
 def finalize_comment_text(text: str, *, allow_grammar_imperfection: bool = True, max_length: int = 300) -> str:
-    finalized = remove_comment_cliches(remove_comment_dashes(text))
+    finalized = remove_chapter_meta_language(remove_comment_cliches(remove_comment_dashes(text)))
     finalized = simplify_comment_apostrophes(finalized)
     if contains_banned_comment_word(finalized):
         logging.info("Generated comment contained ad-related page noise; using a neutral story-safe fallback.")
-        finalized = "This chapter kept the pacing and tension clear enough that I want to see how the next part pays it off."
+        finalized = "The character tension stayed clear, and that final decision feels ready to cause trouble."
     if allow_grammar_imperfection:
         finalized = maybe_add_casual_grammar_imperfection(finalized)
-    finalized = remove_comment_cliches(remove_comment_dashes(finalized))
+    finalized = remove_chapter_meta_language(remove_comment_cliches(remove_comment_dashes(finalized)))
     return trim_comment(finalized, max_length=max_length)
 
 
@@ -2540,8 +2680,14 @@ def overused_history_terms(
     }
 
 
-def candidate_uses_overused_terms(candidate: str, history: list[dict[str, object]]) -> bool:
-    return bool(comment_token_set(candidate) & overused_history_terms(history))
+def candidate_uses_overused_terms(
+    candidate: str,
+    history: list[dict[str, object]],
+    allowed_terms: set[str] | None = None,
+) -> bool:
+    # A recurring character, place, or conflict should remain usable when it was
+    # extracted from the current story. Only unrelated stale terms are blocked.
+    return bool((comment_token_set(candidate) & overused_history_terms(history)) - (allowed_terms or set()))
 
 
 def comments_are_too_similar(candidate: str, previous: str) -> bool:
@@ -2575,10 +2721,17 @@ def repeated_template_phrase(candidate: str, history: list[dict[str, object]]) -
     return False
 
 
-def comment_is_unique(candidate: str, used_comments: set[str], history: list[dict[str, object]]) -> bool:
+def comment_is_unique(
+    candidate: str,
+    used_comments: set[str],
+    history: list[dict[str, object]],
+    allowed_terms: set[str] | None = None,
+) -> bool:
     if contains_banned_comment_word(candidate):
         return False
-    if candidate_uses_overused_terms(candidate, history):
+    if re.search(r"\bchapters?\b", candidate, flags=re.IGNORECASE):
+        return False
+    if candidate_uses_overused_terms(candidate, history, allowed_terms):
         return False
     if repeated_template_phrase(candidate, history):
         return False
@@ -2594,14 +2747,13 @@ def add_contextual_variation(
     second_keyword: str,
     research_context: Optional[ResearchContext],
 ) -> str:
-    title_hint = title_hint_for_comment(context.title, max_length=70)
     base = comment.rstrip(".!?")
     variations = [
         lambda: comment,
         lambda: f"{base} because the {keyword} and {second_keyword} pieces feel connected.",
         lambda: f"{base}; {second_keyword} makes that part feel less random.",
         lambda: f"{base}. The {second_keyword} part is what makes it stick for me.",
-        lambda: f"{title_hint} makes that {keyword} detail feel more deliberate than usual.",
+        lambda: f"The link between {keyword} and {second_keyword} feels more deliberate than it first appeared.",
         lambda: f"What stood out to me was {keyword}, but {second_keyword} might be the real hint.",
         lambda: f"{base}. I would not be surprised if {second_keyword} is the part that matters later.",
     ]
@@ -3090,7 +3242,7 @@ def build_contextual_comment(
         if source_terms and not (comment_token_set(comment) & source_terms):
             logging.info("Rejected generated comment without a current-chapter term.")
             continue
-        if comment_is_unique(comment, used_comments, history):
+        if comment_is_unique(comment, used_comments, history, allowed_terms=source_terms):
             used_comments.add(comment)
             return GeneratedComment(
                 text=comment,
@@ -3101,10 +3253,44 @@ def build_contextual_comment(
                 reflection_used=reflection_used,
             )
 
-    fallback = finalize_comment_text(
-        f"This chapter keeps making {keyword} feel important, especially next to {second_keyword}.",
-        max_length=260,
+    fallback_builders = [
+        lambda: f"The connection between {keyword} and {second_keyword} feels too deliberate to ignore.",
+        lambda: f"I keep wondering whether {keyword} is pushing {second_keyword} toward a bad decision.",
+        lambda: f"{keyword.capitalize()} changes the stakes around {second_keyword} more than I expected.",
+        lambda: f"The reaction to {keyword} says a lot about where {second_keyword} may be heading.",
+        lambda: f"If {keyword} affects {second_keyword} again, that conflict could turn ugly fast.",
+        lambda: f"The choice around {keyword} feels like it will cost {second_keyword} later.",
+        lambda: f"There is more going on between {keyword} and {second_keyword} than anyone is admitting.",
+        lambda: f"{second_keyword.capitalize()} makes the motive behind {keyword} much harder to trust.",
+        lambda: f"The tension around {keyword} changes how I read every reaction to {second_keyword}.",
+        lambda: f"I did not expect {keyword} to put so much pressure on {second_keyword}.",
+        lambda: f"The real question is whether {keyword} protects {second_keyword} or traps them.",
+        lambda: f"That decision involving {keyword} makes {second_keyword} feel like the next major conflict.",
+    ]
+    random.shuffle(fallback_builders)
+    fallback_candidates = [finalize_comment_text(builder(), max_length=260) for builder in fallback_builders]
+    fallback = next(
+        (
+            candidate
+            for candidate in fallback_candidates
+            if comment_is_unique(candidate, used_comments, history, allowed_terms=source_terms)
+        ),
+        "",
     )
+    if not fallback:
+        comparison_pool = [*used_comments, *previous_comment_texts(history)]
+        fallback = min(
+            fallback_candidates,
+            key=lambda candidate: max(
+                (SequenceMatcher(None, comment_signature(candidate), comment_signature(previous)).ratio() for previous in comparison_pool),
+                default=0.0,
+            ),
+        )
+    if fallback in used_comments:
+        fallback = finalize_comment_text(
+            f"{fallback.rstrip('.!?')}. The {choose_neutral_anchor(historical_comment_term_counts(history, used_comments))} adds another layer.",
+            max_length=290,
+        )
     used_comments.add(fallback)
     return GeneratedComment(
         text=fallback,
@@ -4520,6 +4706,17 @@ def process_chapters(
             current_url = next_url
             next_context_min_y = 0
         except (TimeoutException, WebDriverException, JavascriptException) as exc:
+            if driver_session_lost(exc):
+                reason = friendly_browser_error(exc)
+                logging.error("RUN_STOP_REASON: %s", reason)
+                if run_reporter:
+                    run_reporter.update(
+                        status="failed",
+                        stage="browser-disconnected",
+                        stop_reason=reason,
+                        message=reason,
+                    )
+                return completed
             logging.exception("Chapter %s failed gracefully; attempting to continue: %s", chapter_index + 1, exc)
             save_failure_artifacts(driver, history_file, chapter_index)
             if run_reporter:
@@ -4693,7 +4890,8 @@ def main() -> int:
     except Exception as exc:
         logging.exception("Automation failed: %s", exc)
         if run_reporter:
-            run_reporter.update(status="failed", stage="failed", stop_reason=str(exc))
+            reason = friendly_browser_error(exc)
+            run_reporter.update(status="failed", stage="failed", stop_reason=reason, message=reason)
         return 1
     finally:
         if driver_session is not None:

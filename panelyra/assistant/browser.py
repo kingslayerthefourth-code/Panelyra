@@ -13,12 +13,12 @@ from urllib.request import urlopen
 import websocket
 
 
-DEBUG_LIST_URL = "http://127.0.0.1:9222/json/list"
+DEFAULT_DEBUG_PORT = 9222
 
 
-def list_debug_tabs(timeout: float = 2.0) -> list[dict[str, Any]]:
+def list_debug_tabs(timeout: float = 2.0, *, debug_port: int = DEFAULT_DEBUG_PORT) -> list[dict[str, Any]]:
     try:
-        with urlopen(DEBUG_LIST_URL, timeout=timeout) as response:
+        with urlopen(f"http://127.0.0.1:{int(debug_port)}/json/list", timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
     except (OSError, URLError, TimeoutError, json.JSONDecodeError):
         return []
@@ -55,11 +55,12 @@ def inspect_chrome_page(
     *,
     include_screenshot: bool = False,
     screenshot_dir: Path | None = None,
+    debug_port: int = DEFAULT_DEBUG_PORT,
 ) -> dict[str, Any]:
-    tab = choose_tab(list_debug_tabs())
+    tab = choose_tab(list_debug_tabs(debug_port=debug_port))
     websocket_url = str(tab.get("webSocketDebuggerUrl", ""))
     if not websocket_url:
-        return {"available": False, "error": "No inspectable Chrome tab is available on port 9222."}
+        return {"available": False, "error": f"No inspectable Chrome tab is available on port {int(debug_port)}."}
 
     socket = websocket.create_connection(
         websocket_url,
@@ -109,6 +110,7 @@ def inspect_chrome_page(
         )
         snapshot = dict(value) if isinstance(value, dict) else {}
         snapshot["available"] = bool(snapshot)
+        snapshot["debug_port"] = int(debug_port)
         if include_screenshot:
             screenshot = devtools_command(
                 socket,

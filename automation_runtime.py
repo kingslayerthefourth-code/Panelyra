@@ -206,29 +206,52 @@ class RunStore:
         self.root = root
         self.path = root / f"{record.run_id}.json"
         self.checkpoint_path = root / f"{record.run_id}.checkpoint.json"
+        self.capture = None
+        if record.bot_type == 'download':
+            from panelyra.services.capture_store import CaptureStore
+            self.capture = CaptureStore(root.parent)
+            self.capture.create(asdict(record))
         self.save()
 
     @classmethod
     def load(cls, path: Path) -> "RunStore":
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        from panelyra.services.capture_store import CaptureStore
+        capture = CaptureStore(path.parent.parent)
+        payload = capture.read(path.stem)
+        if payload is None:
+            payload = json.loads(path.read_text(encoding="utf-8"))
         store = cls.__new__(cls)
         store.record = RunRecord(**payload)
+        store.capture = None
+        if store.record.bot_type == 'download':
+            from panelyra.services.capture_store import CaptureStore
+            store.capture = CaptureStore(path.parent.parent)
+            store.capture.create(payload)
+            store.record = RunRecord(**store.capture.read(store.record.run_id))
         store.root = path.parent
         store.path = path
         store.checkpoint_path = path.with_name(path.stem + ".checkpoint.json")
         return store
 
     def save(self) -> None:
+        if self.capture:
+            self.record = RunRecord(**self.capture.read(self.record.run_id))
         self.record.updated_at = int(time.time())
         atomic_write_json(self.path, asdict(self.record))
 
     def update(self, **changes: Any) -> None:
+        if self.capture:
+            self.record = RunRecord(**self.capture.update(self.record.run_id, changes))
+            atomic_write_json(self.path, asdict(self.record))
+            return
         for key, value in changes.items():
             if hasattr(self.record, key):
                 setattr(self.record, key, value)
         self.save()
 
     def checkpoint(self, stage: str, **payload: Any) -> None:
+        if self.capture:
+            self.capture.checkpoint(self.record.run_id, stage, payload)
         self.update(stage=stage, message=str(payload.get("message", self.record.message)))
         atomic_write_json(
             self.checkpoint_path,
@@ -243,19 +266,23 @@ class RunStore:
 
 
 def list_run_records(root: Path = RUNS_DIR, limit: int = 100) -> list[dict[str, Any]]:
-    if not root.exists():
-        return []
     records: list[dict[str, Any]] = []
     for path in sorted(root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         if path.name.endswith(".checkpoint.json"):
             continue
         try:
-            records.append(json.loads(path.read_text(encoding="utf-8")))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get('bot_type') == 'download':
+                payload = asdict(RunStore.load(path).record)
+            records.append(payload)
         except (OSError, json.JSONDecodeError):
             continue
         if len(records) >= limit:
             break
-    return records
+    from panelyra.services.capture_store import CaptureStore
+    existing = {row.get('run_id') for row in records}
+    records.extend(row for row in CaptureStore(root.parent).records() if row['run_id'] not in existing)
+    return sorted(records, key=lambda row: row.get('updated_at', 0), reverse=True)[:limit]
 
 
 def active_run_records(root: Path = RUNS_DIR) -> dict[str, dict[str, Any]]:
@@ -335,7 +362,7 @@ def reconcile_stale_run_records(root: Path = RUNS_DIR) -> int:
         if not startup_expired and not process_exited:
             continue
         store.update(
-            status="failed",
+            status="interrupted" if store.capture else "failed",
             stage="process-exited",
             stop_reason="The automation process exited before it could finalize its run.",
         )

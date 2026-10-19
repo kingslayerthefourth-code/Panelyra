@@ -1,0 +1,11 @@
+<script>
+// Streamlit owns the Library scroll container. Remember its position before
+// leaving for the local series service, and restore after the grid is mounted.
+const host=parent, doc=host.document, key='panelyra:library-position';
+const scrollRoot=()=>doc.querySelector('[data-testid="stMain"]')||doc.scrollingElement;
+const save=e=>{if(e.target.closest('a.library-book')){try{host.sessionStorage.setItem(key,JSON.stringify({top:scrollRoot().scrollTop,query:new URL(e.target.closest('a').href).searchParams.get('library_search')}))}catch(_){}}};
+doc.addEventListener('click',save,true);
+let count=0;
+const timer=setInterval(()=>{const grid=doc.querySelector('.library-grid');if(!grid&&++count<40)return;clearInterval(timer);try{const value=JSON.parse(host.sessionStorage.getItem(key)||'null');const query=new URL(host.location.href).searchParams.get('library_search');if(value&&query!==null&&value.query===query){scrollRoot().scrollTo(0,value.top);host.sessionStorage.removeItem(key)}}catch(_){}},100);
+addEventListener('pagehide',()=>{clearInterval(timer);doc.removeEventListener('click',save,true)});
+</script>

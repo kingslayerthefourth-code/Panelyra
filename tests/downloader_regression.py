@@ -32,6 +32,17 @@ class FakeSeriesDriver:
         return ""
 
 
+class BackwardOnlySeriesDriver(FakeSeriesDriver):
+    def execute_script(self, script: str, *args: object) -> object:
+        if "document.querySelectorAll(\"a[href]\")" in script:
+            return [
+                {"href": "https://example.test/content/title/chapter-18", "label": "Vol. 1 Ch. 18"},
+                {"href": "https://example.test/content/title/chapter-19", "label": "Vol. 1 Ch. 19"},
+                {"href": "https://example.test/content/title/chapter-20", "label": "Vol. 1 Ch. 20"},
+            ]
+        return ""
+
+
 class FakeMediaOnlyDriver:
     current_url = "https://reader.other-example.test/read/volume-1/chapter-7"
 
@@ -47,15 +58,28 @@ class FakeLazyReaderDriver:
 
 
 def main() -> int:
-    assert downloader.DEFAULT_DOWNLOAD_CHROME_PROFILE.name == "PanelyraDownloadProfile"
+    assert downloader.DEFAULT_DOWNLOAD_CHROME_PROFILE == (
+        Path.home() / "Library" / "Application Support" / "Panelyra" / "Chrome" / "CaptureProfile"
+    )
+    assert "Google" not in downloader.DEFAULT_DOWNLOAD_CHROME_PROFILE.parts
+    original_argv = sys.argv
+    try:
+        sys.argv = ["manhwa_ocr_downloader.py", "--start-url", "https://example.test/chapter-1"]
+        assert downloader.parse_args().chrome_profile_dir == downloader.DEFAULT_DOWNLOAD_CHROME_PROFILE
+        with tempfile.TemporaryDirectory() as override_root:
+            override = Path(override_root) / "custom-capture-profile"
+            sys.argv += ["--chrome-profile-dir", str(override)]
+            assert downloader.parse_args().chrome_profile_dir == override
+    finally:
+        sys.argv = original_argv
     assert downloader.DOWNLOAD_DEBUG_PORT == 9223
     assert downloader.DOWNLOAD_BROWSER_LOCK.name == "panelyra-capture-browser.lock"
     assert downloader.CAPTURE_PERFORMANCE_PROFILES["rapid"] == {
         "stable_rounds": 2,
         "max_rounds": 12,
-        "download_workers": 8,
+        "download_workers": 4,
     }
-    assert downloader.CAPTURE_PERFORMANCE_PROFILES["balanced"]["download_workers"] == 6
+    assert downloader.CAPTURE_PERFORMANCE_PROFILES["balanced"]["download_workers"] == 4
     assert downloader.CAPTURE_PERFORMANCE_PROFILES["reliable"]["stable_rounds"] == 6
     paginated_snapshot = SimpleNamespace(
         page_total=30,
@@ -254,6 +278,15 @@ def main() -> int:
     assert downloader.is_promotional_asset_url(
         "https://cdn.reader.test/assets/discord-banner.webp"
     )
+    assert downloader.is_promotional_asset_url(
+        "https://cdn.reader.test/placements/native-ad-728x90.webp"
+    )
+    assert downloader.is_promotional_asset_url(
+        "https://pagead2.googlesyndication.com/pagead/imgad?id=fixture"
+    )
+    assert not downloader.is_promotional_asset_url(
+        "https://static.reader.test/chapters/chapter-id/001.webp"
+    )
     assert downloader.image_extension_from_payload(
         "https://cdn.reader.test/page?id=1",
         b"\x89PNG\r\n\x1a\n" + b"x" * 600,
@@ -383,6 +416,18 @@ def main() -> int:
     finally:
         downloader.bot.load_url_with_retries = original_loader
     assert next_url == "https://example.test/content/title/chapter-21"
+    backward_driver = BackwardOnlySeriesDriver()
+    original_loader = downloader.bot.load_url_with_retries
+    try:
+        downloader.bot.load_url_with_retries = lambda active, url, label: True
+        next_url = downloader.next_chapter_from_series(
+            backward_driver,
+            "https://example.test/content/title/chapter-20?page=13",
+            "Read Title - Vol. 1 Ch. 20",
+        )
+    finally:
+        downloader.bot.load_url_with_retries = original_loader
+    assert next_url is None
     with tempfile.TemporaryDirectory() as raw_tmpdir:
         chapter_dir = Path(raw_tmpdir)
         images_dir = chapter_dir / "images"

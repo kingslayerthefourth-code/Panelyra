@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -54,7 +55,22 @@ class ChapterListDriver:
         ]
 
 
+class BackwardOnlyChapterListDriver:
+    current_url = "https://reader.test/title/chapter-20"
+    title = "Series - Chapter 20"
+
+    def execute_script(self, script: str, *args: object) -> object:
+        return [
+            {"href": "https://reader.test/title/chapter-18", "label": "Chapter 18"},
+            {"href": "https://reader.test/title/chapter-19", "label": "Chapter 19"},
+            {"href": "https://reader.test/title/chapter-20", "label": "Chapter 20"},
+        ]
+
+
 def main() -> int:
+    click_source = inspect.getsource(__import__("reader_routing")._click_control)
+    assert "targetChapter <= currentChapter" in click_source
+    assert "targetChapter === null" in click_source
     assert "next chapter" in engage.NEXT_LINK_SELECTOR.lower()
     assert "aria-label*='next' i" not in engage.NEXT_LINK_SELECTOR.lower()
     assert "a[rel='next']" not in {
@@ -116,6 +132,12 @@ def main() -> int:
         ChapterListDriver.current_url,
         ChapterListDriver.title,
     ) == "https://reader.test/title/chapter-5"
+    assert next_chapter_from_visible_list(
+        BackwardOnlyChapterListDriver(),
+        selectors,
+        BackwardOnlyChapterListDriver.current_url,
+        BackwardOnlyChapterListDriver.title,
+    ) is None
 
     print("Reader routing regression checks passed.")
     return 0

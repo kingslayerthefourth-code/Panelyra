@@ -1,0 +1,3 @@
+-keep class androidx.room.** { *; }
+-keep class com.panelyra.tablet.data.** { *; }
+-dontwarn org.jsoup.**

@@ -1,0 +1,370 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 2,
+    "identityHash": "3e8e66515acaf191fc2afd954d5e4ad0",
+    "entities": [
+      {
+        "tableName": "series",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `coverPath` TEXT, `updatedAt` INTEGER NOT NULL, `coverProvenance` TEXT NOT NULL DEFAULT 'thumbnail', `coverVersion` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "coverPath",
+            "columnName": "coverPath",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "coverProvenance",
+            "columnName": "coverProvenance",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'thumbnail'"
+          },
+          {
+            "fieldPath": "coverVersion",
+            "columnName": "coverVersion",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "''"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "chapters",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`seriesId` TEXT NOT NULL, `chapter` TEXT NOT NULL, `chapterNumber` REAL, `title` TEXT NOT NULL, `cbzPath` TEXT NOT NULL, `sha256` TEXT NOT NULL, `pageCount` INTEGER NOT NULL, `byteSize` INTEGER NOT NULL, `sourceUrl` TEXT NOT NULL, `progressPanel` INTEGER NOT NULL, `scrollOffset` INTEGER NOT NULL, `readingMode` TEXT NOT NULL, `completed` INTEGER NOT NULL, `downloadedAt` INTEGER NOT NULL, `lastReadAt` INTEGER NOT NULL, PRIMARY KEY(`seriesId`, `chapter`), FOREIGN KEY(`seriesId`) REFERENCES `series`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "seriesId",
+            "columnName": "seriesId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "chapter",
+            "columnName": "chapter",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "chapterNumber",
+            "columnName": "chapterNumber",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cbzPath",
+            "columnName": "cbzPath",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sha256",
+            "columnName": "sha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageCount",
+            "columnName": "pageCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "byteSize",
+            "columnName": "byteSize",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceUrl",
+            "columnName": "sourceUrl",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "progressPanel",
+            "columnName": "progressPanel",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scrollOffset",
+            "columnName": "scrollOffset",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "readingMode",
+            "columnName": "readingMode",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "completed",
+            "columnName": "completed",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "downloadedAt",
+            "columnName": "downloadedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastReadAt",
+            "columnName": "lastReadAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "seriesId",
+            "chapter"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_chapters_seriesId",
+            "unique": false,
+            "columnNames": [
+              "seriesId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_chapters_seriesId` ON `${TABLE_NAME}` (`seriesId`)"
+          },
+          {
+            "name": "index_chapters_sha256",
+            "unique": false,
+            "columnNames": [
+              "sha256"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_chapters_sha256` ON `${TABLE_NAME}` (`sha256`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "series",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "seriesId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "download_jobs",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `startUrl` TEXT NOT NULL, `chapterCount` INTEGER NOT NULL, `performance` TEXT NOT NULL, `status` TEXT NOT NULL, `engine` TEXT NOT NULL, `currentChapter` INTEGER NOT NULL, `remoteJobId` TEXT, `error` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `resumeUrl` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "startUrl",
+            "columnName": "startUrl",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "chapterCount",
+            "columnName": "chapterCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "performance",
+            "columnName": "performance",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "engine",
+            "columnName": "engine",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentChapter",
+            "columnName": "currentChapter",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "remoteJobId",
+            "columnName": "remoteJobId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "error",
+            "columnName": "error",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resumeUrl",
+            "columnName": "resumeUrl",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "''"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_download_jobs_status",
+            "unique": false,
+            "columnNames": [
+              "status"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_download_jobs_status` ON `${TABLE_NAME}` (`status`)"
+          }
+        ]
+      },
+      {
+        "tableName": "transfers",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `manifest` TEXT NOT NULL, `status` TEXT NOT NULL, `completedChapters` INTEGER NOT NULL, `totalChapters` INTEGER NOT NULL, `receivedBytes` INTEGER NOT NULL, `totalBytes` INTEGER NOT NULL, `bytesPerSecond` INTEGER NOT NULL, `etaSeconds` INTEGER NOT NULL, `error` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "manifest",
+            "columnName": "manifest",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "completedChapters",
+            "columnName": "completedChapters",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalChapters",
+            "columnName": "totalChapters",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedBytes",
+            "columnName": "receivedBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalBytes",
+            "columnName": "totalBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bytesPerSecond",
+            "columnName": "bytesPerSecond",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "etaSeconds",
+            "columnName": "etaSeconds",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "error",
+            "columnName": "error",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '3e8e66515acaf191fc2afd954d5e4ad0')"
+    ]
+  }
+}

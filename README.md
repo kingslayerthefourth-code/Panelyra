@@ -1,26 +1,43 @@
 # Panelyra
 
-**Automation for every chapter.**
+**Your chapters, in one place.**
 
-Panelyra is a local Streamlit and Selenium workspace for authorized chapter-content QA. It keeps Engage, Capture, and Studio runs independent while Panelyra Control provides health, history, storage, settings, support tools, and a context-aware Copilot.
+Panelyra is a local, library-first Streamlit app for reading and downloading chapters. Library is the home page; Downloads searches supported sources, while Capture saves images, CBZ archives and optional OCR from a chapter URL.
 
-The interface uses a sequential workflow: choose a workspace on the Dashboard, complete its focused Configure steps, monitor only that automation in Live, then review its isolated Results. Configuration drafts persist locally between sessions.
+The sidebar is **Library, Downloads, Capture**, followed by **Engage, Activity, Settings**. Capture and Engage use one setup screen with advanced options collapsed. Configuration drafts persist locally. Studio, Dashboard and the floating chat interface have been retired; existing assets and records remain intact.
+
+See [the UI audit](docs/UI_UX_AUDIT.md) for verification and known limitations.
+
+## Folder guide
+
+See [docs/FOLDER_GUIDE.md](docs/FOLDER_GUIDE.md) for the complete layout.
+
+- `panelyra/`: application packages; root Python files are working CLI entrypoints and shared engines.
+- `config/`: preferences and `examples/` for setup. The private `.env` stays at the root for compatibility.
+- `data/history/`: comments, read markers, feedback, and failure evidence.
+- `data/updates/`: library update history, sources, failures, and status.
+- `manhwa/` and `manhwa_clean/`: original and cleaned reading libraries.
+- `outputs/`: generated reports and the Capture promo in `promo/capture-novatoon/`.
+- `runs/`: per-run records and checkpoints.
+- `archive/`: earlier backups, export snapshots, and legacy scripts.
+- `tests/`, `scripts/`, `docs/`: verification, maintenance, and documentation.
 
 ## Workspaces
 
-- **Panelyra Engage** scans chapter context, generates original test comments, submits them on authorized targets, verifies results, and tracks read markers.
-- **Panelyra Capture** collects authorized chapter images, creates CBZ archives, and produces optional OCR transcripts.
-- **Panelyra Studio** renders Word Art, uploads media to an editor, inserts text, and verifies save or publish signals.
-- **Panelyra Copilot** answers product questions, diagnoses run evidence, prepares workflow configuration, inspects the attached Chrome tab, and drafts support responses.
-- **Panelyra Control** provides onboarding, environment health, run history, report exports, storage management, presets, settings, and help.
+- **Library:** searchable covers, direct reading resume, edition selection and chapter files. Trim page edges crops margins only and preserves Originals. Tablet delivery is available in chapter actions.
+- **Downloads:** search, choose a series and chapter range, then download. Review staged archives before importing into Library. Missing chapters and failed search sources are reported separately.
+- **Capture:** images, CBZ archives and optional OCR. Advanced selectors and performance options are collapsed; browser review and explicit start/stop remain available.
+- **Engage:** contextual comments with review, submission and verification on authorized targets.
+- **Activity:** durable run receipts, failure details and report export. Retired Studio records remain readable but cannot be relaunched.
+- **Settings:** General, Connections, Storage and Help/diagnostics.
 
-Every automation run writes an atomic record under `runs/`. Existing root-level history, read markers, uploads, downloads, and Chrome sessions remain compatible with the pre-Panelyra build.
+User libraries, progress, presets, conversations and historical records are preserved. Internal screen renderers live in `panelyra/screens/`; automation engines retain their interfaces.
 
 ## Authorization
 
-Use Panelyra only on sites and content you own, administer, or have explicit permission to test or archive. Publishing and capture workflows require an authorization confirmation in the dashboard.
+Use Panelyra only on sites and content you own, administer, or have explicit permission to test or archive. Browser workflows require an explicit start or review action.
 
-Panelyra runs locally. It sends data outside the Mac only when you configure an external research provider or model API.
+Panelyra runs locally. Search, source downloads, browser workflows and optional external research contact their selected services.
 
 ## Setup
 
@@ -33,13 +50,13 @@ python -m pip install -r requirements.txt
 Copy local configuration examples:
 
 ```bash
-cp urls.txt.example urls.txt
-cp comments.txt.example comments.txt
-cp research_context.json.example research_context.json
-cp .env.example .env
+cp config/examples/urls.txt.example urls.txt
+cp config/examples/comments.txt.example comments.txt
+cp config/examples/research_context.json.example research_context.json
+cp config/examples/.env.example .env
 ```
 
-For optional model-enhanced Copilot responses, add `OPENAI_API_KEY` to `.env`, then restart Panelyra. Copilot remains usable with its local knowledge and diagnostic engine when no key is configured.
+The AI interface has been removed. No local model is required or contacted by the app. Existing conversation files remain on disk.
 
 ## Launch
 
@@ -54,7 +71,7 @@ On macOS, the single-click launcher is:
 ```
 
 The launcher resolves its own folder, activates `.venv` when present, and opens the
-Panelyra dashboard on `http://localhost:8517`. Use this launcher rather than a
+Panelyra Library on `http://localhost:8517`. Use this launcher rather than a
 legacy `Launch_AsuraAutomation.command` from an older project copy.
 
 ## Browser Profile
@@ -126,25 +143,82 @@ Capture filters obvious promotional assets, validates responses, deduplicates im
 
 The Capture Configure flow lets you independently enable raw images, CBZ archive creation, and OCR text. When only CBZ is selected, temporary source images are removed after the archive is built.
 
-Panelyra allows one browser automation workflow at a time because Engage, Capture, and Studio share the authenticated Chrome profile. A second workflow is blocked with a clear busy message until the active run finishes or is stopped.
+Capture's persistent Chrome profile lives at `~/Library/Application Support/Panelyra/Chrome/CaptureProfile`, outside Chrome's protected application-data folder. The legacy `Google/Chrome/PanelyraDownloadProfile` is left untouched; you may need to sign in once in Capture's new browser. Downloaded books are unaffected. An explicit `--chrome-profile-dir` still overrides this default.
 
-## Panelyra Copilot
+Browser automation workflows retain their busy checks and browser locks to avoid conflicting runs.
 
-Copilot is available as a dedicated **Assistant** page and as the compact `AI` popover on other pages. It has five modes:
+## Quiet Library Updates
 
-- **Auto** selects a mode from the request and preserves the previous mode for short follow-up questions.
-- **Ask** explains Panelyra behavior using the local product knowledge base.
-- **Diagnose** evaluates structured run records, recent log events, browser state, selectors, and saved output.
-- **Configure** proposes and can apply safe form values without starting a run.
-- **Support** drafts user-facing replies and can create an editable local support ticket.
+The standalone updater checks every series already present in `manhwa/`, discovers
+newly added books on each pass, and saves only chapters newer than the highest local
+chapter. Quiet mode uses HTTP and never opens Chrome:
 
-Every answer can expose its evidence and suggested actions. Controlled actions can navigate to a workspace, validate configuration, restore a previous run as a retry draft, inspect Chrome, apply configuration values, or create a support ticket. Copilot never starts, stops, submits, publishes, deletes, or uploads on its own.
+The generic updater recognizes Asura, Thunder, Kayn, Novatoon, and compatible
+WordPress/Madara readers. Novatoon chapter images are isolated from its logos,
+recommendation covers, avatars, and reader UI artwork.
 
-Browser inspection reads the active Chrome tab through the local debugging port. DOM evidence is shown in the Assistant page; screenshots are captured only when browser inspection and screenshots are enabled in Settings. External web research is disabled by default and is used only for explicit external-research questions when the model integration is enabled.
+```bash
+python series_update_tracker.py --library --quiet --once
+python series_update_tracker.py --library --quiet
+```
 
-## Studio Output
+Protected or malformed chapters are written to `data/updates/failed_updates.json` instead of
+interrupting the desktop. Retry them quietly, in invisible Chrome, or in the visible
+Capture browser only when you choose to:
 
-Studio provides a live composition preview with text and panel colors, text alignment, panel placement, and layout style. It can leave the target editor open for review or activate the configured save/publish control.
+```bash
+python series_update_tracker.py --retry-failed --quiet
+python series_update_tracker.py --retry-failed --headless-browser
+python series_update_tracker.py --retry-failed --browser
+```
+
+`downloaded_chapters.json` contains successful chapter URLs only.
+`update_tracker_status.json` records the latest check, and `series_sources.json`
+remembers inferred or manually supplied landing pages. For a book whose chapter
+metadata cannot reveal its series page, add this form to `series_sources.json`:
+
+```json
+{
+  "local-series-folder": {
+    "series_urls": ["https://example.com/manga/series-name"]
+  }
+}
+```
+
+Panelyra does not need to remain open. On macOS, automatic three-hour quiet checks
+are opt-in:
+
+```bash
+python series_update_tracker.py --install-schedule
+python series_update_tracker.py --uninstall-schedule
+```
+
+The scheduler never selects a browser retry mode. Use these features only for
+content you are authorized to archive.
+
+## Huawei Tablet App
+
+`android/` contains the native Panelyra Reader + Downloader APK project for
+EMUI/Android 9 and newer. It starts with an empty, Original-only library and
+keeps completed chapters as CBZ files in the app's external files directory.
+
+Open **Settings → Connections** in desktop Panelyra to start the HTTPS companion
+and display its pairing QR. The tablet attempts a direct download first and uses
+the paired Mac automatically when a source needs desktop Chrome. Pairing is
+certificate-pinned and the Mac exposes only isolated, completed tablet jobs.
+
+Build the debug APK with JDK 17, Android SDK 36, and Gradle 9.3.1:
+
+```bash
+cd android
+./gradlew :app:assembleDebug
+```
+
+The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
+
+## Legacy Studio assets
+
+Existing Studio files and historical run records are preserved. There is no Studio launch screen in the current product. Old Studio routes redirect to Library with a notice.
 
 For a paginated Capture run:
 
@@ -165,6 +239,7 @@ panelyra/
   components/
   models/
   services/
+  screens/
   styles/
 config/
 data/

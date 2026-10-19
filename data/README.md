@@ -1,3 +1,5 @@
-# Data
+# Local application data
 
-This directory is reserved for a future opt-in data migration. Existing root-level comment history, read markers, and owner request records remain authoritative so upgrades do not break local history.
+`history/` contains comment and read history, feedback and failure evidence.
+`updates/` contains library updater sources, downloaded chapter history, failures and status.
+These directories are local state and ignored by Git.

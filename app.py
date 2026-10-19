@@ -8,23 +8,31 @@ Run:
 
 from __future__ import annotations
 
+import html
+import base64
 import json
 import os
 import random
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
+from statistics import median
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import streamlit as st
+from PIL import Image
 from streamlit.components import v1 as components
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from automation_runtime import (
     RUNS_DIR,
@@ -42,13 +50,21 @@ from automation_runtime import (
 )
 from history_utils import append_jsonl_record, read_jsonl_records
 from panelyra.assistant import (
-    AssistantReply,
+    CONVERSATIONS,
+    DEFAULT_LOCAL_MODEL,
+    PANELYRA_SYSTEM_PROMPT,
+    AssistantTurnPlan,
     CopilotContext,
+    LocalModelClient,
+    LocalModelError,
+    PageContext,
+    PanelyraKnowledgeService,
     WorkspaceRun,
+    assistant_requests_browser_inspection,
     build_model_prompt,
-    create_local_reply,
     extract_log_events,
     needs_external_research,
+    plan_assistant_turn,
 )
 from panelyra.assistant.browser import inspect_chrome_page
 from panelyra.models.product import (
@@ -60,13 +76,24 @@ from panelyra.models.product import (
     WORKSPACES,
     runtime_type_for_page,
 )
+from panelyra.progress_ui import (
+    PROGRESS_CSS,
+    RunProgressModel,
+    build_progress_html,
+    extract_activity_items,
+    resolve_health,
+    resolve_progress_state,
+)
 from panelyra.services.health import environment_health, format_bytes
 from panelyra.services.local_reader import start_local_reader_server
+from panelyra.services.reader_progress import ReaderProgressStore
+from panelyra.services.manhwa_cleaner import clean_chapter, detect_boundary_promos
 from panelyra.services.paths import (
     DOWNLOADS_DIR,
     LEGACY_DOWNLOAD_DIR,
     PANELYRA_CACHE_DIR,
     PANELYRA_LOG_DIR,
+    READER_PROGRESS_FILE,
     RESEARCH_CONTEXT_FILE,
     ensure_runtime_directories,
 )
@@ -84,6 +111,11 @@ from panelyra.services.support import (
 
 
 APP_DIR = Path(__file__).resolve().parent
+
+# Keep the local tablet endpoint available while Panelyra is open. Pairing and
+# certificate state remain on disk; do not require reopening Settings each run.
+from tablet_ui import ensure_companion
+# LAN listeners and USB watching are explicit connection tools, not app startup.
 ensure_runtime_directories()
 reconcile_stale_run_records()
 ENV_FILE = APP_DIR / ".env"
@@ -91,11 +123,11 @@ BOT_PATH = APP_DIR / "bot.py"
 NOTE_ART_BOT_PATH = APP_DIR / "note_art_bot.py"
 MANHWA_OCR_BOT_PATH = APP_DIR / "manhwa_ocr_downloader.py"
 BOT_PYTHON = APP_DIR / ".venv" / "bin" / "python"
-HISTORY_FILE = APP_DIR / "comment_history.jsonl"
-READ_MARKER_FILE = APP_DIR / "read_markers.jsonl"
+HISTORY_FILE = APP_DIR / "data/history/comment_history.jsonl"
+READ_MARKER_FILE = APP_DIR / "data/history/read_markers.jsonl"
 RESEARCH_FILE = RESEARCH_CONTEXT_FILE
-OWNER_REQUESTS_FILE = APP_DIR / "owner_requests.jsonl"
-ASSISTANT_FEEDBACK_FILE = APP_DIR / "assistant_feedback.jsonl"
+OWNER_REQUESTS_FILE = APP_DIR / "data/history/owner_requests.jsonl"
+ASSISTANT_FEEDBACK_FILE = APP_DIR / "data/history/assistant_feedback.jsonl"
 LOG_DIR = PANELYRA_LOG_DIR
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 PYTHON_CACHE_DIR = PANELYRA_CACHE_DIR
@@ -167,56 +199,75 @@ READER_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 def reader_sort_key(path: Path) -> tuple[int, int | str, str]:
     """Sort zero-padded page/chapter folders numerically when possible."""
-    if path.stem.isdigit():
-        return (0, int(path.stem), path.name.lower())
+    number = re.search(r"(?:chapter|ch|episode)?[-_ ]*(\d+(?:\.\d+)?)", path.stem, re.I)
+    if number:
+        return (0, float(number.group(1)), path.name.lower())
     return (1, path.stem.lower(), path.name.lower())
 
 
 def reader_catalog() -> dict[str, dict[str, object]]:
-    """Index local original and clean manhwa folders without exposing their paths."""
-    catalog: dict[str, dict[str, object]] = {}
-    roots = (
-        ("Original", DOWNLOADS_DIR),
-        ("Clean", APP_DIR / "manhwa_clean"),
-    )
-    for edition, root in roots:
-        if not root.is_dir():
+    from panelyra.services.reading_catalog import catalog
+    return catalog(APP_DIR)
+
+
+def _reader_cover_data(entry: dict[str, object]) -> str:
+    """Return a small disposable data thumbnail without touching chapter files."""
+    candidates: list[Path] = []
+    saved_cover = APP_DIR / "data/reader_covers" / (str(entry.get("series_key", "")) + ".cover")
+    if saved_cover.is_file():
+        candidates.append(saved_cover)
+    editions = entry.get("editions", {})
+    if isinstance(editions, dict):
+        for chapters in editions.values():
+            if not isinstance(chapters, dict):
+                continue
+            for chapter in chapters.values():
+                if isinstance(chapter, dict):
+                    metadata = chapter.get("metadata", {})
+                    if isinstance(metadata, dict):
+                        raw_cover = metadata.get("cover") or metadata.get("cover_path")
+                        if raw_cover:
+                            cover_path = Path(str(raw_cover))
+                            if cover_path.is_file():
+                                candidates.append(cover_path)
+                    candidates.extend(list(chapter.get("images", []))[:1])
+    for path in candidates:
+        try:
+            with Image.open(path) as image:
+                image.thumbnail((320, 420))
+                from io import BytesIO
+                output = BytesIO()
+                image.convert("RGB").save(output, "JPEG", quality=78, optimize=True)
+                return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+        except (OSError, ValueError):
             continue
-        for series_dir in sorted((path for path in root.iterdir() if path.is_dir()), key=reader_sort_key):
-            series_key = series_dir.name.removesuffix("-clean")
-            chapter_map: dict[str, dict[str, object]] = {}
-            series_title = series_key.replace("-", " ").title()
-            for chapter_dir in sorted((path for path in series_dir.iterdir() if path.is_dir()), key=reader_sort_key):
-                images_dir = chapter_dir / "images"
-                if not images_dir.is_dir():
-                    continue
-                images = sorted(
-                    (path for path in images_dir.iterdir() if path.suffix.lower() in READER_IMAGE_SUFFIXES),
-                    key=reader_sort_key,
-                )
-                if not images:
-                    continue
-                metadata_path = chapter_dir / "metadata.json"
-                metadata: dict[str, object] = {}
-                if metadata_path.is_file():
-                    try:
-                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError):
-                        metadata = {}
-                title = str(metadata.get("series_title") or series_title).strip()
-                if title:
-                    series_title = title
-                chapter_map[chapter_dir.name] = {
-                    "images": images,
-                    "title": str(metadata.get("title") or f"Chapter {chapter_dir.name}").strip(),
-                }
-            if chapter_map:
-                entry = catalog.setdefault(series_key, {"title": series_title, "editions": {}})
-                entry["title"] = series_title
-                editions = entry["editions"]
-                if isinstance(editions, dict):
-                    editions[edition] = chapter_map
-    return catalog
+    return ""
+
+
+def _chapter_number(value: str) -> float:
+    match = re.search(r"\d+(?:\.\d+)?", value)
+    return float(match.group()) if match else -1.0
+
+
+def _chapter_integrity(chapter: dict[str, object]) -> tuple[bool, str]:
+    if 'status' in chapter:
+        return (True, 'Ready') if chapter.get('healthy') and chapter.get('verified') else (False, str(chapter.get('error') or chapter['status']))
+    images = [Path(item) for item in chapter.get("images", [])]
+    if not images or any(not image.is_file() for image in images):
+        return False, "Missing image"
+    archive = Path(chapter["chapter_dir"]) / "chapter-pages.cbz"
+    if archive.is_file():
+        try:
+            with zipfile.ZipFile(archive) as bundle:
+                if bundle.testzip():
+                    return False, "Invalid CBZ"
+        except (OSError, zipfile.BadZipFile):
+            return False, "Invalid CBZ"
+    return True, "Ready"
+
+
+
+
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -266,25 +317,267 @@ def load_local_env_file(path: Path) -> None:
 
 load_local_env_file(ENV_FILE)
 PREFERENCES = load_preferences()
+LOCAL_MODEL_CLIENT = None  # AI interface retired; do not connect to a model at startup.
+KNOWLEDGE_SERVICE = None
+
+
+def save_local_preferences(values: dict[str, object]) -> bool:
+    """Merge local Mac preferences so one settings panel cannot erase another."""
+    preferences = load_preferences()
+    preferences.update(values)
+    return save_preferences(preferences)
+
+
+def clean_report_for_series(series: str) -> dict[str, object]:
+    report_path = APP_DIR / "manhwa_clean" / f"{series}-clean" / "cleaning-report.json"
+    if not report_path.is_file():
+        return {}
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def render_cleaning_preview(image_path: Path, *, top: int = 0, bottom: int = 0, label: str) -> None:
+    with Image.open(image_path) as image:
+        width, height = image.size
+        top = max(0, min(top, height - 1))
+        bottom = max(0, min(bottom, height - top - 1))
+        preview_height = min(height - top - bottom, max(1, int(width * 2.2)))
+        if bottom:
+            start = max(top, height - bottom - preview_height)
+        else:
+            start = top
+        preview = image.crop((0, start, width, min(height - bottom, start + preview_height)))
+    st.image(preview, caption=label, width=280)
+
+
+def start_clean_review(series: str, chapter: str, chapter_dir: Path, *, reuse_previous: bool = False) -> None:
+    images = sorted(
+        (path for path in (chapter_dir / "images").iterdir() if path.suffix.lower() in READER_IMAGE_SUFFIXES),
+        key=reader_sort_key,
+    )
+    if not images:
+        st.session_state.reader_clean_review = {}
+        return
+    suggestion = detect_boundary_promos(images[0], images[-1])
+    if reuse_previous:
+        report = clean_report_for_series(series)
+        chapters = report.get("chapters", {}) if isinstance(report, dict) else {}
+        if isinstance(chapters, dict):
+            previous = None
+            for name in sorted(chapters, key=lambda value: (0, int(value)) if str(value).isdigit() else (1, str(value))):
+                if name != chapter and isinstance(chapters[name], dict):
+                    previous = chapters[name]
+            if isinstance(previous, dict):
+                first = previous.get("first_page", {})
+                last = previous.get("last_page", {})
+                if isinstance(first, dict) and isinstance(last, dict):
+                    suggestion = type(suggestion)(
+                        int(first.get("top_crop_pixels", suggestion.first_top) or 0),
+                        int(last.get("bottom_crop_pixels", suggestion.last_bottom) or 0),
+                        "reused",
+                        "Reused crop values from an earlier cleaned chapter in this series.",
+                    )
+    st.session_state.reader_clean_review = {
+        "series": series,
+        "chapter": chapter,
+        "first_top": int(suggestion.first_top),
+        "last_bottom": int(suggestion.last_bottom),
+        "reason": suggestion.reason,
+        "confidence": suggestion.confidence,
+    }
+
+
+def original_reader_selection(catalog: dict[str, dict[str, object]]) -> tuple[str, dict[str, object], dict[str, dict[str, object]], list[str]] | None:
+    if not catalog:
+        return None
+    series_options = sorted(catalog, key=lambda key: str(catalog[key]["title"]).lower())
+    if st.session_state.reader_series not in series_options:
+        st.session_state.reader_series = series_options[0]
+    selected_series = str(st.session_state.reader_series)
+    selected_entry = catalog[selected_series]
+    editions = selected_entry["editions"]
+    if not isinstance(editions, dict) or "Original" not in editions:
+        return None
+    original_chapters = editions["Original"]
+    if not isinstance(original_chapters, dict):
+        return None
+    chapter_options = sorted(original_chapters, key=lambda value: (0, int(value)) if value.isdigit() else (1, value))
+    if st.session_state.reader_chapter not in chapter_options:
+        st.session_state.reader_chapter = chapter_options[0]
+    return selected_series, selected_entry, original_chapters, chapter_options
+
+
+def render_cleaner_review(catalog: dict[str, dict[str, object]]) -> None:
+    catalog = {key: entry for key, entry in catalog.items() if entry.get("editions", {}).get("Original")}
+    selection = original_reader_selection(catalog)
+    if selection is None:
+        st.info("Trimming needs an Original chapter with image files.")
+        return
+
+    selected_series, selected_entry, original_chapters, chapter_options = selection
+    series_options = sorted(catalog, key=lambda key: str(catalog[key]["title"]).lower())
+    selected_series = st.selectbox(
+        "Choose a series",
+        options=series_options,
+        key="reader_series",
+        format_func=lambda key: str(catalog[key]["title"]),
+        help="Open this list and scroll to the series you want to clean.",
+    )
+    selected_entry = catalog[selected_series]
+    editions = selected_entry["editions"]
+    original_chapters = editions["Original"] if isinstance(editions, dict) else {}
+    chapter_options = sorted(original_chapters, key=lambda value: (0, int(value)) if value.isdigit() else (1, value))
+    if st.session_state.reader_chapter not in chapter_options:
+        st.session_state.reader_chapter = chapter_options[0]
+
+    picker_columns = st.columns([2, 1])
+    picker_columns[0].caption(f"Chapter {st.session_state.reader_chapter}")
+    clean_report = clean_report_for_series(selected_series)
+    clean_chapters = editions.get("Clean", {}) if isinstance(editions, dict) else {}
+    clean_exists = st.session_state.reader_chapter in clean_chapters
+    picker_columns[1].metric("Clean status", "Ready" if clean_exists else "Not created")
+
+    current_chapter = st.session_state.reader_chapter
+    current_entry = original_chapters[current_chapter]
+    actions = st.columns(4)
+    if actions[0].button("Review Chapter", key="cleaner_review_current", type="primary", width="stretch"):
+        start_clean_review(selected_series, current_chapter, Path(current_entry["chapter_dir"]))
+        st.rerun()
+    if actions[1].button("Reuse Last Crop", key="cleaner_reuse_current", width="stretch"):
+        start_clean_review(selected_series, current_chapter, Path(current_entry["chapter_dir"]), reuse_previous=True)
+        st.rerun()
+    if actions[2].button("Back to Library", key="cleaner_open_reader", width="stretch"):
+        set_page("Reader")
+        st.rerun()
+    if actions[3].button("View Report", key="cleaner_report", disabled=not bool(clean_report), width="stretch"):
+        st.session_state.reader_clean_review = {
+            "series": selected_series,
+            "chapter": current_chapter,
+            "show_report": True,
+        }
+        st.rerun()
+
+    selected_batch = st.multiselect(
+        "Cleaning queue",
+        options=chapter_options,
+        default=st.session_state.reader_clean_batch,
+        key="reader_clean_batch",
+        format_func=lambda value: f"Chapter {value}",
+        help="Each queued chapter opens in this review page before Panelyra writes a clean copy.",
+    )
+    if st.button("Start Queue", key="cleaner_batch_start", disabled=not selected_batch, width="stretch"):
+        first_chapter = selected_batch[0]
+        st.session_state.reader_chapter = first_chapter
+        start_clean_review(selected_series, first_chapter, Path(original_chapters[first_chapter]["chapter_dir"]))
+        st.rerun()
+
+    review = st.session_state.get("reader_clean_review", {})
+    if isinstance(review, dict) and review.get("series") == selected_series:
+        if review.get("show_report"):
+            with st.expander("Cleaning report", expanded=True):
+                st.json(clean_report or {"status": "No cleaning report found yet."})
+            return
+        if review.get("chapter") not in original_chapters:
+            return
+        review_chapter = str(review["chapter"])
+        review_entry = original_chapters[review_chapter]
+        review_images = review_entry["images"]
+        first_image = Path(review_images[0])
+        last_image = Path(review_images[-1])
+        with Image.open(first_image) as first:
+            first_height = first.height
+        with Image.open(last_image) as last:
+            last_height = last.height
+        st.subheader(f"Review cleaning for Chapter {review_chapter}")
+        st.caption(str(review.get("reason") or "Move the crop handles, preview, then apply."))
+        first_top = st.slider(
+            "First page top crop",
+            min_value=0,
+            max_value=max(0, first_height - 1),
+            value=min(int(review.get("first_top", 0) or 0), max(0, first_height - 1)),
+            step=10,
+            key=f"reader_clean_first_top_{selected_series}_{review_chapter}",
+            help="Removes pixels from the top of the first image.",
+        )
+        last_bottom = st.slider(
+            "Last page bottom crop",
+            min_value=0,
+            max_value=max(0, last_height - 1),
+            value=min(int(review.get("last_bottom", 0) or 0), max(0, last_height - 1)),
+            step=10,
+            key=f"reader_clean_last_bottom_{selected_series}_{review_chapter}",
+            help="Removes pixels from the bottom of the last image.",
+        )
+        preview_columns = st.columns(4)
+        with preview_columns[0]:
+            render_cleaning_preview(first_image, label="First page before")
+        with preview_columns[1]:
+            render_cleaning_preview(first_image, top=first_top, label="First page after")
+        with preview_columns[2]:
+            render_cleaning_preview(last_image, label="Last page before")
+        with preview_columns[3]:
+            render_cleaning_preview(last_image, bottom=last_bottom, label="Last page after")
+
+        apply_columns = st.columns(3)
+        if apply_columns[0].button("Apply Clean Copy", key="reader_clean_apply", type="primary", width="stretch"):
+            try:
+                result = clean_chapter(
+                    Path(review_entry["chapter_dir"]).parent,
+                    APP_DIR / "manhwa_clean",
+                    review_chapter,
+                    first_top=first_top,
+                    last_bottom=last_bottom,
+                    app_dir=APP_DIR,
+                )
+                st.success(f"Cleaned Chapter {review_chapter}. CBZ rebuilt at {display_path(result.archive_file)}.")
+                st.cache_data.clear()
+                queue = [value for value in st.session_state.reader_clean_batch if value != review_chapter]
+                st.session_state.reader_clean_batch = queue
+                if queue:
+                    next_chapter = queue[0]
+                    st.session_state.reader_chapter = next_chapter
+                    start_clean_review(selected_series, next_chapter, Path(original_chapters[next_chapter]["chapter_dir"]))
+                else:
+                    st.session_state.reader_clean_review = {}
+                st.rerun()
+            except Exception as error:
+                st.error(f"Could not clean this chapter: {error}")
+        if apply_columns[1].button("Reset Suggestion", key="reader_clean_reset", width="stretch"):
+            start_clean_review(selected_series, review_chapter, Path(review_entry["chapter_dir"]))
+            st.rerun()
+        if apply_columns[2].button("Cancel", key="reader_clean_cancel", width="stretch"):
+            st.session_state.reader_clean_review = {}
+            st.rerun()
 
 DEFAULT_SETTINGS = {
-    "default_landing_page": "Dashboard",
-    "compact_ui": False,
+    "default_landing_page": str(PREFERENCES.get("default_landing_page", "Library")),
+    "compact_ui": bool(PREFERENCES.get("compact_ui", False)),
+    "compact_sidebar": bool(PREFERENCES.get("compact_sidebar", False)),
     "show_sidebar_paths": False,
-    "console_max_chars": 60_000,
-    "auto_refresh_seconds": 2,
-    "history_rows": 30,
-    "top_keywords": 10,
-    "reflection_every_n_comments": 5,
+    "console_max_chars": int(PREFERENCES.get("console_max_chars", 60_000)),
+    "auto_refresh_seconds": int(PREFERENCES.get("auto_refresh_seconds", 2)),
+    "progress_animation": str(PREFERENCES.get("progress_animation", "Subtle")),
+    "progress_history": bool(PREFERENCES.get("progress_history", True)),
+    "mac_notifications": bool(PREFERENCES.get("mac_notifications", False)),
+    "history_rows": int(PREFERENCES.get("history_rows", 30)),
+    "top_keywords": int(PREFERENCES.get("top_keywords", 10)),
+    "reflection_every_n_comments": int(PREFERENCES.get("reflection_every_n_comments", 5)),
     "assistant_enabled": True,
-    "assistant_internet_endpoint": "",
-    "assistant_history_limit": 40,
-    "assistant_model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-    "assistant_use_openai_web": False,
-    "assistant_use_model": True,
-    "assistant_show_evidence": True,
-    "assistant_allow_browser_inspection": True,
+    "assistant_internet_endpoint": str(PREFERENCES.get("assistant_internet_endpoint", "")),
+    "assistant_history_limit": int(PREFERENCES.get("assistant_history_limit", 40)),
+    "assistant_save_history": bool(PREFERENCES.get("assistant_save_history", True)),
+    "assistant_local_model": str(PREFERENCES.get("assistant_local_model", DEFAULT_LOCAL_MODEL)),
+    "assistant_model": str(PREFERENCES.get("assistant_model", os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))),
+    "assistant_web_search_enabled": bool(PREFERENCES.get("assistant_web_search_enabled", False)),
+    "assistant_use_openai_web": bool(PREFERENCES.get("assistant_use_openai_web", False)),
+    "assistant_use_model": bool(PREFERENCES.get("assistant_use_model", True)),
+    "assistant_show_evidence": bool(PREFERENCES.get("assistant_show_evidence", True)),
+    "assistant_allow_browser_inspection": bool(PREFERENCES.get("assistant_allow_browser_inspection", True)),
     "assistant_generated_plan": "",
+    "show_lyra_in_immersive_reader": bool(PREFERENCES.get("show_lyra_in_immersive_reader", False)),
     "onboarding_complete": bool(PREFERENCES.get("onboarding_complete", False)),
     "authorization_confirmed": bool(PREFERENCES.get("authorization_confirmed", False)),
     "retention_days": int(PREFERENCES.get("retention_days", 30)),
@@ -734,8 +1027,8 @@ def stream_openai_assistant(
         return
 
     system_context = (
-        "You are Panelyra Copilot, grounded in the supplied local application context. "
-        "Help users operate Engage, Capture, Studio, settings, diagnostics, and support. "
+        "I'm Lyra, Panelyra's built-in assistant, grounded in the supplied local application context. "
+        "Help users use Library, Downloads, Capture, Engage, Lyra, Activity and Settings. Studio is retired. "
         "Treat run records, log evidence, browser state, output counts, and the Panelyra knowledge base as authoritative. "
         "Never invent actions, successful submissions, downloaded files, browser state, support updates, or web findings. "
         "Do not say an action was completed unless the context explicitly confirms it. "
@@ -1184,7 +1477,7 @@ def page_overview_help() -> str:
     return (
         "**Dashboard Pages**\n\n"
         "- `Dashboard`: three workspace launch choices and recent-run status.\n"
-        "- `Engage`, `Capture`, and `Studio`: independent workspaces with `Configure`, `Live`, and `Results` views.\n"
+        "- `Library` is the home for saved books; `Downloads` finds titles; `Capture` saves a chapter URL.\n"
         "- `Configure`: a short sequential setup that shows one decision stage at a time.\n"
         "- `Live`: isolated progress, controls, and runtime diagnostics.\n"
         "- `Results`: records and artifacts for that workspace only.\n"
@@ -1221,8 +1514,8 @@ def local_app_help_response(prompt: str, records: list[dict[str, object]], statu
             "- `Console characters`: controls how much log text each Live Room displays.\n"
             "- `Auto-refresh seconds`: controls refresh speed while the bot is running.\n"
             "- `Quote/philosophy cadence`: controls how often a quote/philosophical style is added.\n"
-            "- `Assistant`: toggles the floating button, model name, web search, and internet endpoint.\n"
-            "- `Support Requests`: local requests users ask the assistant to send to the owner."
+            "- `AI`: configures Lyra’s local model, browser inspection and optional web search.\n"
+            "- `Help`: instructions and local diagnostics. Support-ticket management is retired."
         )
 
     if "research endpoint" in normalized or "research file" in normalized:
@@ -1246,10 +1539,10 @@ def local_app_help_response(prompt: str, records: list[dict[str, object]], statu
     if any(term in normalized for term in ("assistant", "reply", "user", "support", "owner request", "support request")):
         sections.append(
             "**Assistant And User Replies**\n\n"
-            "- The floating assistant is one chat box. Ask it for help with comments, users, settings, logs, support, or site workflow.\n"
+            "- Open Lyra from the sidebar for help with settings, logs and workflows.\n"
             "- If a user reports a problem, ask: `write a reply to a user who says ...` and include the problem details.\n"
             "- To make a local owner/support request, ask the assistant to contact the owner and describe the issue.\n"
-            "- If `OPENAI_API_KEY` is missing, the assistant can still answer built-in app questions like this one, but broad general AI answers require the key."
+            "- Lyra requires the configured local Ollama model; open Settings → AI if it is disconnected."
         )
 
     if any(term in normalized for term in ("comment style", "comment styles", "quote cadence", "emoji", "keyword")):
@@ -1271,7 +1564,7 @@ def local_app_help_response(prompt: str, records: list[dict[str, object]], statu
 def assistant_response(prompt: str, records: list[dict[str, object]], status_label: str) -> str:
     normalized = prompt.lower()
     if owner_request_intent(prompt):
-        record = create_owner_request(prompt, st.session_state.page, status_label)
+        return "Support-ticket management is retired. Open Settings → Help for diagnostics."
         return (
             "**Owner Request Created**\n\n"
             f"- Request ID: {record['id']}\n"
@@ -1323,6 +1616,9 @@ def assistant_response(prompt: str, records: list[dict[str, object]], status_lab
 def stop_bot(process: subprocess.Popen | None, timeout_seconds: float = 8.0) -> None:
     if not is_process_running(process):
         return
+
+    update_run_record_by_pid(process.pid, status='stopped', stage='stopped',
+                             stop_reason='Stopped from the Panelyra dashboard.')
 
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -1382,9 +1678,17 @@ def launch_tracked_process(
     log_path: Path,
     settings: dict[str, object],
 ) -> subprocess.Popen:
+    environment = subprocess_env()
+    if bot_type == 'download':
+        from panelyra.engine import policy
+        from panelyra.services.worker_runtime import engine_environment
+        if policy(APP_DIR):
+            raise ValueError('Background work is paused in Settings. Resume it before starting Capture.')
+        environment.update(engine_environment(APP_DIR))
     record = RunRecord.create(bot_type, settings, log_path)
     store = RunStore(record)
-    environment = subprocess_env()
+    if store.capture:
+        store.capture.command(record.run_id, command)
     environment["PANELYRA_RUN_RECORD"] = str(store.path)
     environment["ASURA_RUN_RECORD"] = str(store.path)
     log_handle = log_path.open("a", encoding="utf-8", buffering=1)
@@ -1407,7 +1711,7 @@ def launch_tracked_process(
             f"macOS sleep protection active for {bot_type} process {process.pid}.\n"
         )
     log_handle.close()
-    store.update(status="running", stage="process-started", pid=process.pid)
+    store.update(pid=process.pid)
     st.session_state.run_record_paths[bot_type] = str(store.path)
     return process
 
@@ -1613,7 +1917,12 @@ def start_note_art_bot(
         command,
         bot_type="word_art",
         log_path=log_path,
-        settings={"note_url": note_url, "style": style_mode, "skip_submit": skip_submit},
+        settings={
+            "note_url": note_url,
+            "style": style_mode,
+            "skip_submit": skip_submit,
+            "image_path": str(image_path),
+        },
     )
     st.session_state.bot_runtimes["word_art"] = {
         "process": process, "log_path": log_path, "signal_path": signal_path, "paused": False
@@ -1643,7 +1952,7 @@ def start_manhwa_ocr_bot(
     performance_profile: str,
 ) -> tuple[subprocess.Popen, Path, Optional[Path]]:
     start_url = normalize_web_url(start_url)
-    max_chapters = max(1, min(20, int(max_chapters)))
+    max_chapters = max(1, min(10000, int(max_chapters)))
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     log_path = LOG_DIR / f"manhwa-ocr-{timestamp}.log"
     signal_path = (
@@ -1695,6 +2004,8 @@ def start_manhwa_ocr_bot(
     if not save_ocr:
         command.append("--skip-ocr")
 
+    command[1:2] = ["-m", "panelyra.automation.managed_capture", "--root", str(APP_DIR)]
+
     startup_banner = (
         "Starting Panelyra Capture process...\n"
         "Working directory: Panelyra workspace\n"
@@ -1712,6 +2023,9 @@ def start_manhwa_ocr_bot(
             "output_dir": output_dir,
             "reader_layout": reader_layout,
             "wait_for_inspection": wait_for_inspection,
+            "save_images": save_images,
+            "create_archive": create_archive,
+            "save_ocr": save_ocr,
         },
     )
     st.session_state.bot_runtimes["download"] = {
@@ -1732,10 +2046,16 @@ def inject_styles() -> None:
         .page-title { font-size: 1.65rem; }
         .page-subtitle, .muted, .primary-action-copy { font-size: 0.84rem; }
         """
+    sidebar_css = ""
+    if st.session_state.get("compact_sidebar", False):
+        sidebar_css = """
+        section[data-testid="stSidebar"] { min-width: 13rem !important; width: 13rem !important; }
+        section[data-testid="stSidebar"] .brand-tagline { display: none; }
+        section[data-testid="stSidebar"] button[kind] { min-height: 2.3rem; }
+        """
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;520;650;760&family=Space+Grotesk:wght@560;650;720&display=swap');
         :root {
             --bg: #0B0C10;
             --bg-2: #0D0E12;
@@ -1758,6 +2078,15 @@ def inject_styles() -> None:
             --glass-border: rgba(255, 255, 255, 0.08);
             --shadow-lg: 0 30px 90px rgba(0,0,0,0.48);
             --shadow-md: 0 20px 54px rgba(0,0,0,0.34);
+            --radius-sm: 10px;
+            --radius-md: 16px;
+            --radius-lg: 22px;
+            --focus-ring: 0 0 0 3px rgba(38, 198, 218, 0.24);
+            --motion-fast: 160ms;
+            --motion-base: 320ms;
+        }
+        [data-testid="stHeader"], [data-testid="stToolbar"], .stDeployButton {
+            display: none !important;
         }
         html, body, [data-testid="stAppViewContainer"], .main {
             background:
@@ -1770,7 +2099,8 @@ def inject_styles() -> None:
             padding: 5.25rem 1.75rem 2.25rem 1.75rem;
             max-width: 1360px;
             position: relative;
-            animation: pageFadeUp 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+            /* A transform animation here becomes the containing block for fixed UI. */
+            animation: none;
         }
         .block-container::before {
             content: "";
@@ -1795,6 +2125,14 @@ def inject_styles() -> None:
         }
         section[data-testid="stSidebar"] * {
             color: var(--text);
+        }
+        section[data-testid="stSidebar"] [data-testid="stSidebarContent"] { padding-top: 1.15rem; }
+        section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+            color: #687386 !important;
+            font-size: 0.67rem !important;
+            font-weight: 760 !important;
+            letter-spacing: 0.12em !important;
+            text-transform: uppercase;
         }
         section[data-testid="stSidebar"] code {
             color: var(--text);
@@ -1879,34 +2217,46 @@ def inject_styles() -> None:
         div.stButton > button:active {
             transform: scale(0.96) translateY(1px);
         }
-        section[data-testid="stSidebar"] div.stButton > button {
-            background: transparent;
-            color: var(--text);
+        button:focus-visible, input:focus-visible, textarea:focus-visible,
+        [role="radio"]:focus-visible, [role="checkbox"]:focus-visible {
+            outline: 2px solid #67E8F9 !important;
+            outline-offset: 3px !important;
+            box-shadow: var(--focus-ring) !important;
+        }
+        section[data-testid="stSidebar"] button[kind] {
+            background: transparent !important;
+            color: var(--text) !important;
             border: 1px solid transparent;
             justify-content: flex-start;
             box-shadow: none;
             position: relative;
             overflow: hidden;
         }
-        section[data-testid="stSidebar"] div.stButton > button::before {
+        section[data-testid="stSidebar"] button[kind]::before {
             content: "";
             position: absolute;
             inset: 4px 6px;
             border-radius: 8px;
-            background: linear-gradient(180deg, rgba(0,180,216,0.14), rgba(123,44,191,0.075));
+            background: transparent;
             opacity: 0;
             transform: translateY(12px) scale(0.96);
             transition: opacity 360ms cubic-bezier(0.16, 1, 0.3, 1), transform 360ms cubic-bezier(0.16, 1, 0.3, 1);
             z-index: -1;
         }
-        section[data-testid="stSidebar"] div.stButton > button:hover {
+        section[data-testid="stSidebar"] button[kind]:hover {
             background: transparent;
             border-color: var(--line);
             color: var(--text);
         }
-        section[data-testid="stSidebar"] div.stButton > button:hover::before {
+        section[data-testid="stSidebar"] button[kind]:hover::before {
             opacity: 1;
             transform: translateY(0) scale(1);
+        }
+        section[data-testid="stSidebar"] button[kind][kind="primary"] {
+            color: #ECFEFF !important;
+            border-color: rgba(103,232,249,.42) !important;
+            background: #183d38 !important;
+            box-shadow: inset 3px 0 #67E8F9, 0 10px 24px rgba(0,0,0,.18) !important;
         }
         input, textarea, select, div[data-baseweb="select"] > div {
             background-color: #11131A !important;
@@ -2000,6 +2350,62 @@ def inject_styles() -> None:
                 inset 0 1px rgba(255,255,255,0.08),
                 0 28px 64px rgba(0,0,0,0.44);
         }
+        .journey-card {
+            height: 12.8rem;
+            min-height: 12.8rem;
+            border: 1px solid rgba(255,255,255,0.085);
+            border-radius: var(--radius-md);
+            padding: 1.1rem 1.15rem;
+            background: linear-gradient(145deg, rgba(255,255,255,.06), rgba(11,12,16,.72));
+            position: relative;
+            overflow: hidden;
+        }
+        .journey-card::before {
+            content: "";
+            position: absolute;
+            inset: 0 auto 0 0;
+            width: 3px;
+            background: linear-gradient(180deg, #67E8F9, rgba(155,138,251,.72));
+        }
+        .journey-icon { font-size: 1.25rem; margin-bottom: .65rem; }
+        .journey-title { font: 720 1rem/1.2 "Space Grotesk", sans-serif; }
+        .journey-copy { color: var(--muted); font-size: .82rem; line-height: 1.55; margin-top: .42rem; }
+        .journey-output { color: #CFFAFE; font-size: .72rem; font-weight: 700; margin-top: .65rem; }
+        div[data-testid="stHorizontalBlock"]:has(.journey-card) > div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"] {
+            height: 100%;
+            display: grid;
+            grid-template-rows: 1fr auto;
+            align-content: stretch;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.journey-card) div.stButton > button {
+            margin-top: .65rem;
+        }
+        .st-key-dashboard_engage button,
+        .st-key-dashboard_capture button,
+        .st-key-dashboard_reader button {
+            min-height: 3rem !important;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.st-key-dashboard_continue) {
+            align-items: stretch;
+            margin-top: .8rem;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.st-key-dashboard_continue) div[data-testid="stAlert"],
+        .st-key-dashboard_continue,
+        .st-key-dashboard_continue button {
+            height: 100%;
+            min-height: 3.35rem;
+        }
+        .setup-stepper { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.5rem; margin:-.25rem 0 1.35rem; }
+        .setup-step { border:1px solid var(--line); border-radius:12px; padding:.72rem .78rem; background:rgba(18,20,27,.76); color:var(--muted); font-size:.75rem; font-weight:680; }
+        .setup-step strong { display:block; color:inherit; font-size:.67rem; margin-bottom:.15rem; opacity:.72; }
+        .setup-step.is-complete { color:#A7F3D0; border-color:rgba(46,196,182,.24); }
+        .setup-step.is-current { color:#ECFEFF; border-color:rgba(103,232,249,.52); background:linear-gradient(145deg,rgba(0,180,216,.14),rgba(155,138,251,.08)); box-shadow:0 0 28px rgba(0,180,216,.09); }
+        .autosave-note { display:flex; align-items:center; gap:.4rem; margin:.2rem 0 1rem; color:var(--muted); font-size:.78rem; }
+        .autosave-note::before { content:"✓"; color:var(--success); font-weight:800; }
+        .onboarding-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.7rem; margin:.8rem 0; }
+        .onboarding-item { padding:.85rem; border-radius:12px; background:rgba(255,255,255,.035); border:1px solid var(--line); }
+        .onboarding-item strong { display:block; margin-bottom:.25rem; }
+        .onboarding-item span { color:var(--muted); font-size:.78rem; line-height:1.45; }
         .mac-traffic {
             display: flex;
             gap: 8px;
@@ -2282,94 +2688,6 @@ def inject_styles() -> None:
         }
         .traffic-yellow { animation-delay: 120ms; }
         .traffic-green { animation-delay: 240ms; }
-        div[data-testid="stPopover"] {
-            position: fixed !important;
-            right: 30px !important;
-            bottom: 30px !important;
-            z-index: 999999 !important;
-            width: 58px !important;
-            height: 58px !important;
-            min-width: 58px !important;
-            max-width: 58px !important;
-            display: block !important;
-            margin: 0 !important;
-            transform: none !important;
-        }
-        div[data-testid="stElementContainer"]:has(div[data-testid="stPopover"]) {
-            position: fixed !important;
-            bottom: 30px !important;
-            right: 30px !important;
-            z-index: 999999 !important;
-            width: 58px !important;
-            height: 58px !important;
-            min-width: 58px !important;
-            max-width: 58px !important;
-            margin: 0 !important;
-            transform: none !important;
-        }
-        div[data-testid="stPopover"] > div {
-            width: 58px !important;
-            height: 58px !important;
-            min-width: 58px !important;
-            max-width: 58px !important;
-        }
-        div[data-testid="stPopover"] button {
-            width: 58px !important;
-            height: 58px !important;
-            min-width: 58px !important;
-            max-width: 58px !important;
-            min-height: 58px !important;
-            max-height: 58px !important;
-            border-radius: 50% !important;
-            padding: 0 !important;
-            font-size: 0;
-            display: grid;
-            place-items: center;
-            border: 1px solid rgba(0,180,216,0.42) !important;
-            background:
-                radial-gradient(circle at 34% 26%, rgba(0,180,216,0.35), transparent 34%),
-                radial-gradient(circle at 72% 74%, rgba(123,44,191,0.26), transparent 38%),
-                linear-gradient(180deg, rgba(255,255,255,0.095), rgba(255,255,255,0.032)),
-                #1F2128 !important;
-            box-shadow:
-                inset 0 1px rgba(255,255,255,0.13),
-                0 22px 58px rgba(0,0,0,0.52),
-                0 0 34px rgba(0,180,216,0.18) !important;
-            animation: aiFloat 3.2s ease-in-out infinite;
-        }
-        div[data-testid="stPopover"] button p,
-        div[data-testid="stPopover"] button span,
-        div[data-testid="stPopover"] button svg {
-            display: none !important;
-        }
-        div[data-testid="stPopover"] button::before {
-            content: "💬";
-            color: var(--text);
-            font-size: 1.25rem;
-            line-height: 1;
-        }
-        div[data-testid="stPopover"] button:hover {
-            transform: translateY(-3px) scale(1.04);
-            box-shadow:
-                inset 0 1px rgba(255,255,255,0.16),
-                0 28px 68px rgba(0,0,0,0.62),
-                0 0 44px rgba(0,180,216,0.26) !important;
-        }
-        div[data-testid="stPopoverBody"] {
-            position: fixed !important;
-            right: 30px !important;
-            bottom: 104px !important;
-            z-index: 999998 !important;
-            width: min(420px, calc(100vw - 60px));
-            max-height: min(76vh, 720px);
-            overflow: auto;
-            border: 1px solid var(--line-strong);
-            border-radius: 16px;
-            background:
-                linear-gradient(180deg, rgba(255,255,255,0.055), rgba(0,180,216,0.018)),
-                #1A1C23;
-            box-shadow: var(--shadow-lg);
-        }
         .assistant-shell {
             border: 1px solid var(--line-strong);
             border-radius: 18px;
@@ -2620,7 +2938,9 @@ def inject_styles() -> None:
             box-shadow: inset 0 1px rgba(255,255,255,0.075), 0 14px 36px rgba(0,0,0,0.26) !important;
         }
         .page-title {
-            font-size: clamp(1.65rem, 3vw, 2.35rem) !important;
+            font-size: clamp(1.55rem, 2.35vw, 2.15rem) !important;
+            line-height: 1.12;
+            max-width: 980px;
         }
         .app-shell {
             padding: 1.25rem 1.35rem !important;
@@ -2664,28 +2984,20 @@ def inject_styles() -> None:
             div[data-testid="stHorizontalBlock"] {
                 gap: 0.65rem;
             }
+            .setup-stepper { grid-template-columns:repeat(2,minmax(0,1fr)); }
+            .onboarding-grid { grid-template-columns:1fr; }
+            .journey-card { height:auto; min-height:10.5rem; }
         }
         __COMPACT_CSS__
+        __SIDEBAR_CSS__
         </style>
-        """.replace("__COMPACT_CSS__", compact_css),
+        """.replace("__COMPACT_CSS__", compact_css).replace("__SIDEBAR_CSS__", sidebar_css),
         unsafe_allow_html=True,
     )
 
 
 def render_page_header(title: str, subtitle: str, pills: list[str] | None = None) -> None:
-    pill_html = ""
-    if pills:
-        pill_html = "<div class='pill-row'>" + "".join(f"<span class='pill'>{pill}</span>" for pill in pills) + "</div>"
-    st.markdown(
-        f"""
-        <div class="app-shell">
-          <div class="page-title">{title}</div>
-          <div class="page-subtitle">{subtitle}</div>
-          {pill_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<header class="app-shell"><h1 class="page-title">{html.escape(title)}</h1><p class="page-subtitle">{html.escape(subtitle)}</p></header>', unsafe_allow_html=True)
 
 
 def render_global_bar(page: str, status: str) -> None:
@@ -2711,6 +3023,43 @@ def render_panel(title: str, body: str) -> None:
           <div class="muted">{body}</div>
         </div>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_journey_card(icon: str, title: str, body: str, output: str) -> None:
+    st.markdown(
+        f"""
+        <section class="journey-card" aria-label="{html.escape(title)}">
+          <div class="journey-icon" aria-hidden="true">{html.escape(icon)}</div>
+          <div class="journey-title">{html.escape(title)}</div>
+          <div class="journey-copy">{html.escape(body)}</div>
+          <div class="journey-output">Creates: {html.escape(output)}</div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_setup_stepper(current: int, labels: tuple[str, str, str, str]) -> None:
+    current_step = max(1, min(4, int(current)))
+    items = []
+    for index, label in enumerate(labels, start=1):
+        state = "is-current" if index == current_step else "is-complete" if index < current_step else ""
+        state_text = "Current" if index == current_step else "Complete" if index < current_step else "Upcoming"
+        items.append(
+            f'<div class="setup-step {state}" aria-label="Step {index}: {html.escape(label)}, {state_text}">'
+            f'<strong>STEP {index}</strong>{html.escape(label)}</div>'
+        )
+    st.markdown(
+        '<nav class="setup-stepper" aria-label="Workflow progress">' + "".join(items) + "</nav>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_draft_note() -> None:
+    st.markdown(
+        '<div class="autosave-note" role="status">Changes are kept automatically on this Mac.</div>',
         unsafe_allow_html=True,
     )
 
@@ -2742,7 +3091,7 @@ def render_jsonl_metric_grid(records: list[dict[str, object]], columns: int = 4)
             col.metric(label, value)
 
 
-def build_copilot_context(records: list[dict[str, object]]) -> CopilotContext:
+def build_copilot_context(records: list[dict[str, object]], query: str = "") -> CopilotContext:
     run_records = list_run_records(limit=100)
     bot_to_workspace = {
         "comment": "engage",
@@ -2787,9 +3136,13 @@ def build_copilot_context(records: list[dict[str, object]]) -> CopilotContext:
         else 0
     )
     current_page = str(st.session_state.page)
-    current_view = str(
-        st.session_state.get(f"{current_page.lower()}_view", "Overview")
-    )
+    current_view = str(st.session_state.get(f"{current_page.lower()}_view", "Overview"))
+    selected_run_context = st.session_state.get("assistant_run_context", {})
+    if current_page == "Assistant" and isinstance(selected_run_context, dict):
+        selected_workspace = str(selected_run_context.get("workspace", "")).strip().lower()
+        if selected_workspace in {"engage", "capture", "studio"}:
+            current_page = selected_workspace.title()
+            current_view = "Live"
     recent_comments = tuple(
         str(record.get("comment", "")).strip()
         for record in records[-12:]
@@ -2823,6 +3176,53 @@ def build_copilot_context(records: list[dict[str, object]]) -> CopilotContext:
         "capture_root": str(OCR_DOWNLOAD_DIR),
         "studio_preview": str(st.session_state.studio_preview_path or ""),
     }
+    catalog = reader_catalog()
+    chapter_availability: dict[str, list[str]] = {}
+    original_chapters = 0
+    clean_chapters = 0
+    reader_series: list[dict[str, object]] = []
+    for series_key, entry in catalog.items():
+        editions = entry.get("editions", {}) if isinstance(entry, dict) else {}
+        edition_summary: dict[str, list[str]] = {}
+        if isinstance(editions, dict):
+            for edition, chapters in editions.items():
+                chapter_names = sorted(str(name) for name in chapters) if isinstance(chapters, dict) else []
+                edition_summary[str(edition)] = chapter_names
+                if str(edition) == "Original":
+                    original_chapters += len(chapter_names)
+                elif str(edition) == "Clean":
+                    clean_chapters += len(chapter_names)
+                for chapter in chapter_names:
+                    chapter_availability.setdefault(chapter, []).append(str(edition))
+        reader_series.append(
+            {
+                "key": str(series_key),
+                "title": str(entry.get("title", series_key)) if isinstance(entry, dict) else str(series_key),
+                "editions": edition_summary,
+            }
+        )
+    history_summary = tuple(
+        {
+            "workspace": {"comment": "Engage", "download": "Capture", "word_art": "Studio"}.get(
+                str(record.get("bot_type", "")), "Unknown"
+            ),
+            "status": str(record.get("status", "unknown")),
+            "stage": str(record.get("stage", "")),
+            "message": str(record.get("message", "") or record.get("stop_reason", ""))[:500],
+        }
+        for record in run_records[:12]
+    )
+    health_checks = environment_health()
+    page_context = PageContext(
+        page=current_page,
+        view=current_view,
+        workspace=current_page.lower() if current_page.lower() in {"engage", "capture", "studio"} else "",
+        series=str(st.session_state.get("reader_series", "")),
+        edition=str(st.session_state.get("reader_edition", "Original")),
+        chapter=str(st.session_state.get("reader_chapter", "")),
+        attached_run=str(selected_run_context.get("run_id", "")) if isinstance(selected_run_context, dict) else "",
+    )
+    grounding = KNOWLEDGE_SERVICE.retrieve(query, page_context) if query else None
     return CopilotContext(
         current_page=current_page,
         current_view=current_view,
@@ -2833,29 +3233,44 @@ def build_copilot_context(records: list[dict[str, object]]) -> CopilotContext:
         recent_comments=recent_comments,
         tickets=tuple(read_owner_requests()),
         browser_snapshot=dict(st.session_state.assistant_browser_snapshot),
-    )
-
-
-def copilot_message_from_reply(reply: AssistantReply, content: str | None = None) -> dict[str, object]:
-    message = reply.to_message()
-    if content:
-        message["content"] = content
-    return message
-
-
-def record_assistant_feedback(message: dict[str, object], rating: str) -> None:
-    append_jsonl_record(
-        ASSISTANT_FEEDBACK_FILE,
-        {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "message_id": message.get("id", ""),
-            "rating": rating,
-            "mode": message.get("mode", ""),
-            "page": st.session_state.page,
-            "response": str(message.get("content", ""))[:4_000],
+        reader={
+            "series": reader_series,
+            "original_chapters": original_chapters,
+            "clean_chapters": clean_chapters,
+            "chapter_availability": chapter_availability,
+            "selected": {
+                "series": str(st.session_state.get("reader_series", "")),
+                "edition": str(st.session_state.get("reader_edition", "Original")),
+                "chapter": str(st.session_state.get("reader_chapter", "")),
+            },
+            "resume": "Stored privately by the local Reader in browser storage.",
         },
+        run_history=history_summary,
+        environment={
+            str(check.get("check", "Check")): {
+                "status": str(check.get("status", "")),
+                "detail": str(check.get("detail", "")),
+            }
+            for check in health_checks
+        },
+        product={
+            "name": PRODUCT_NAME,
+            "version": PRODUCT_VERSION,
+            "mode": PRODUCT_MODE,
+            "navigation": NAVIGATION_GROUPS,
+            "workspaces": ["Library", "Downloads", "Capture", "Engage", "Lyra", "Activity", "Settings"],
+        },
+        grounding=(json.loads(grounding.prompt_text) if grounding and grounding.relevant else {}),
+        grounding_sources=grounding.source_labels if grounding else (),
     )
-    message["feedback"] = rating
+
+
+def copilot_message_from_plan(
+    plan: AssistantTurnPlan,
+    content: str,
+    provider: str,
+) -> dict[str, object]:
+    return plan.to_message(content, provider)
 
 
 def action_workspace_record(workspace: str) -> dict[str, object]:
@@ -2870,15 +3285,106 @@ def action_workspace_record(workspace: str) -> dict[str, object]:
     )
 
 
+def prepare_capture_review_from_lyra(payload: dict[str, object]) -> str:
+    """Prepare Capture and open Chrome, but never release the user's start signal."""
+    if not bool(payload.get("explicit_request")):
+        return "Lyra blocked the preparation because the request was not an explicit Capture command."
+    values = payload.get("values", {})
+    values = dict(values) if isinstance(values, dict) else {}
+    url = normalize_web_url(str(values.get("url", "")))
+    issues = preflight_url(url)
+    if issues:
+        return "Capture was not prepared: " + "; ".join(issues) + ". Your draft was kept."
+    download_runtime = st.session_state.bot_runtimes.get("download", {})
+    if is_process_running(download_runtime.get("process")):
+        return "Capture already has an active run. Stop or finish it before Lyra prepares another one."
+    owner = browser_lock_owner()
+    if owner:
+        return (
+            f"Chrome is currently reserved by {owner.get('bot_type', 'another Panelyra workflow')}. "
+            "Lyra kept the Capture draft but did not open a second browser."
+        )
+
+    apply_ocr_download_defaults()
+    routing = {
+        "infinite-scroll": "continuous",
+        "next-link": "next-chapter",
+    }.get(str(values.get("routing", "auto")), str(values.get("routing", "auto")))
+    st.session_state.ocr_start_url = url
+    st.session_state.ocr_max_chapters = max(1, min(10000, int(values.get("max_chapters", 1))))
+    st.session_state.ocr_reader_layout = routing if routing in {
+        "auto", "continuous", "next-chapter", "paginated", "mixed"
+    } else "auto"
+    st.session_state.ocr_performance_profile = str(values.get("performance", "Balanced"))
+    st.session_state.ocr_save_images = bool(values.get("save_images", True))
+    st.session_state.ocr_create_archive = bool(values.get("create_archive", True))
+    st.session_state.ocr_save_text = bool(values.get("save_ocr", False))
+    st.session_state.capture_setup_step = 3
+
+    selector_issues = []
+    if not str(st.session_state.ocr_next_chapter_selector).strip():
+        selector_issues.append("the next-chapter selector is missing")
+    if st.session_state.ocr_reader_layout in {"paginated", "mixed"} and not str(
+        st.session_state.ocr_next_page_selector
+    ).strip():
+        selector_issues.append("the next-page selector is missing")
+    if selector_issues:
+        set_page("Capture Setup")
+        return "Lyra filled the Capture draft but could not open browser review because " + "; ".join(selector_issues) + "."
+
+    output_dir = str(
+        Path(str(st.session_state.ocr_custom_output_dir).strip() or str(OCR_DOWNLOAD_DIR)).expanduser()
+    )
+    process, log_path, signal_path = start_manhwa_ocr_bot(
+        url,
+        int(st.session_state.ocr_max_chapters),
+        True,
+        output_dir,
+        str(st.session_state.ocr_container_selector).strip() or MANHWA_CONTAINER_SELECTOR,
+        str(st.session_state.ocr_download_image_selector).strip() or MANHWA_IMAGE_SELECTOR,
+        float(st.session_state.ocr_download_confidence),
+        float(st.session_state.ocr_scroll_min_delay),
+        float(st.session_state.ocr_scroll_max_delay),
+        float(st.session_state.ocr_image_fetch_timeout),
+        bool(st.session_state.ocr_save_images),
+        bool(st.session_state.ocr_create_archive),
+        bool(st.session_state.ocr_save_text),
+        str(st.session_state.ocr_reader_layout),
+        str(st.session_state.ocr_next_chapter_selector).strip(),
+        str(st.session_state.ocr_next_page_selector).strip(),
+        str(st.session_state.ocr_page_counter_selector).strip(),
+        str(st.session_state.ocr_chapter_list_selector).strip(),
+        str(st.session_state.ocr_performance_profile),
+    )
+    st.session_state.bot_process = process
+    st.session_state.log_path = log_path
+    st.session_state.start_signal_path = signal_path
+    st.session_state.lyra_capture_prepared = True
+    st.session_state.lyra_capture_review_status = "waiting for browser review"
+    st.session_state.lyra_capture_browser_snapshot = {}
+    st.session_state.lyra_capture_expected_url = url
+    set_page("Capture Live")
+    return (
+        f"Capture is prepared for `{url}` and Chrome is opening in review mode. "
+        "Inspect the reader, then click **Begin Capture**. Lyra has not started downloading."
+    )
+
+
 def execute_copilot_action(action: dict[str, object]) -> str:
     kind = str(action.get("kind", ""))
     payload = action.get("payload", {})
     payload = dict(payload) if isinstance(payload, dict) else {}
+    if str(payload.get("workspace", "")).lower() == "studio" and kind != "navigate":
+        return "Studio is retired. Its saved files and history remain available; no configuration was changed."
+    if kind in {"create_ticket", "create_owner_request"}:
+        return "Support-ticket management has been retired. Open Settings → Help for diagnostics."
+    if kind == "prepare_capture_review":
+        return prepare_capture_review_from_lyra(payload)
     if kind == "navigate":
         page = str(payload.get("page", "Dashboard"))
         view = str(payload.get("view", ""))
         set_page(page)
-        if view and page in {"Engage", "Capture", "Studio"}:
+        if view and page in {"Engage", "Capture"}:
             st.session_state[f"{page.lower()}_view"] = view
         return f"Opened {page}{f' {view}' if view else ''}."
     if kind == "prepare_retry":
@@ -2916,10 +3422,6 @@ def execute_copilot_action(action: dict[str, object]) -> str:
                 }.get(str(values["routing"]), str(values["routing"]))
                 st.session_state.ocr_reader_layout = capture_routing
             st.session_state.capture_setup_step = 1
-        elif workspace == "studio":
-            if values.get("url"):
-                st.session_state.note_url = str(values["url"])
-            st.session_state.studio_setup_step = 1
         set_page(workspace.title())
         st.session_state[f"{workspace}_view"] = "Configure"
         return f"Applied the proposal to {workspace.title()} Configure. No workflow was started."
@@ -2959,6 +3461,43 @@ def execute_copilot_action(action: dict[str, object]) -> str:
                 details.append("Missing selector fields: " + ", ".join(missing))
             return f"{workspace.title()} validation needs attention: {'; '.join(details)}"
         return f"{workspace.title()} validation passed for `{url}`. No settings were changed."
+    if kind == "restore_selector_profile":
+        workspace = str(payload.get("workspace", ""))
+        profile_name = str(payload.get("profile", "Generic chapter reader"))
+        if workspace not in {"engage", "capture"}:
+            return "That workspace does not support selector-profile repair."
+        profiles = load_selector_profiles()
+        if profile_name not in profiles:
+            return f"Selector profile `{profile_name}` is not available. No settings were changed."
+        profile = profiles[profile_name]
+        if workspace == "engage":
+            st.session_state.selected_selector_profile = profile_name
+            field_map = {
+                "engage_next_link_selector": "next_link",
+                "engage_next_page_selector": "next_page",
+                "engage_page_counter_selector": "page_counter",
+                "engage_chapter_list_selector": "chapter_list",
+                "engage_comment_editor_selector": "comment_editor",
+                "engage_submit_button_selector": "submit",
+                "engage_thanks_button_selector": "thanks",
+                "engage_confirmation_selector": "confirmation",
+            }
+        else:
+            st.session_state.ocr_selector_profile = profile_name
+            field_map = {
+                "ocr_next_chapter_selector": "next_link",
+                "ocr_next_page_selector": "next_page",
+                "ocr_page_counter_selector": "page_counter",
+                "ocr_chapter_list_selector": "chapter_list",
+            }
+        for field, profile_key in field_map.items():
+            st.session_state[field] = str(profile.get(profile_key, ""))
+        set_page(workspace.title())
+        st.session_state[f"{workspace}_view"] = "Configure"
+        return (
+            f"Restored `{profile_name}` selectors for {workspace.title()}. "
+            "Review and validate them before starting a workflow."
+        )
     if kind == "inspect_browser":
         if not st.session_state.assistant_allow_browser_inspection:
             return "Browser inspection is disabled in Settings."
@@ -2988,56 +3527,76 @@ def execute_copilot_action(action: dict[str, object]) -> str:
     return "That assistant action is not supported."
 
 
+def execute_contextual_fix(action: dict[str, object]) -> str:
+    kind = str(action.get("kind", ""))
+    if kind not in {"apply_configuration", "restore_selector_profile", "prepare_retry"}:
+        return "Panelyra blocked an unsupported Assistant fix."
+    result = execute_copilot_action(action)
+    payload = action.get("payload", {})
+    payload = dict(payload) if isinstance(payload, dict) else {}
+    workspace = str(payload.get("workspace", ""))
+    if workspace not in {"engage", "capture", "studio"}:
+        return result
+    validation = execute_copilot_action(
+        {
+            "kind": "validate_configuration",
+            "payload": {"workspace": workspace, "values": {}},
+        }
+    )
+    return f"{result}\n\nValidation: {validation}"
+
+
 def render_copilot_details(message: dict[str, object], key_prefix: str) -> None:
     evidence = message.get("evidence", [])
-    actions = message.get("actions", [])
-    mode = str(message.get("mode", "Ask"))
-    confidence = str(message.get("confidence", ""))
-    st.caption(f"{mode} mode · {confidence} confidence")
+    provider = str(message.get("provider", "Local AI"))
+    st.caption(provider)
     if st.session_state.assistant_show_evidence and isinstance(evidence, list) and evidence:
-        with st.expander("Evidence", expanded=False):
-            for item in evidence:
-                if not isinstance(item, dict):
-                    continue
-                st.markdown(
-                    f"**{item.get('label', 'Evidence')}**: {item.get('value', '')}  \n"
-                    f"Source: `{item.get('source', 'local context')}`"
-                )
-    if isinstance(actions, list) and actions:
-        action_columns = st.columns(min(2, len(actions)))
-        for index, action in enumerate(actions):
-            if not isinstance(action, dict):
-                continue
-            label = str(action.get("label", "Run action"))
-            description = str(action.get("description", ""))
-            if action.get("requires_confirmation"):
-                description = f"Confirmation required. {description}".strip()
-            if action_columns[index % len(action_columns)].button(
-                label,
-                key=f"{key_prefix}_action_{action.get('action_id', index)}",
-                help=description or None,
+        visible_evidence = [item for item in evidence if isinstance(item, dict)]
+        if visible_evidence:
+            with st.expander(f"Sources · {len(visible_evidence)}", expanded=False):
+                for item in visible_evidence:
+                    label = str(item.get("label") or item.get("source") or "Local context")
+                    value = str(item.get("value", "")).strip()
+                    st.markdown(f"**{label}**")
+                    st.caption(value or str(item.get("source", "Panelyra context")))
+
+    action = message.get("action")
+    if isinstance(action, dict) and str(action.get("kind", "")) in {
+        "apply_configuration",
+        "restore_selector_profile",
+        "prepare_retry",
+    }:
+        with st.container(border=True, key=f"{key_prefix}_single_fix"):
+            st.markdown(f"#### {action.get('label', 'Suggested change')}")
+            st.caption("Suggested configuration change")
+            st.write(str(action.get("description", "Review this local change before applying it.")))
+            confirmed = st.checkbox(
+                "I reviewed this change",
+                key=f"{key_prefix}_confirm_{action.get('action_id', 'safe')}",
+                help="Lyra never changes automation settings without your confirmation.",
+            )
+            if st.button(
+                "Apply fix",
+                key=f"{key_prefix}_apply_fix_{action.get('action_id', 'safe')}",
+                type="primary",
                 width="stretch",
+                disabled=not confirmed,
             ):
-                st.session_state.assistant_action_notice = execute_copilot_action(action)
+                outcome = execute_contextual_fix(action)
+                st.session_state.assistant_messages.append(
+                    {
+                        "id": f"assistant-fix-{uuid.uuid4().hex[:10]}",
+                        "role": "assistant",
+                        "content": outcome,
+                        "intent": "Fix result",
+                        "confidence": "high",
+                        "provider": "Panelyra validation",
+                        "evidence": [],
+                        "action": None,
+                    }
+                )
+                CONVERSATIONS.replace(st.session_state.lyra_conversation_token, st.session_state.assistant_messages)
                 st.rerun()
-    if not message.get("feedback"):
-        feedback_columns = st.columns(2)
-        if feedback_columns[0].button(
-            "Helpful",
-            key=f"{key_prefix}_helpful",
-            width="stretch",
-        ):
-            record_assistant_feedback(message, "helpful")
-            st.rerun()
-        if feedback_columns[1].button(
-            "Needs work",
-            key=f"{key_prefix}_needs_work",
-            width="stretch",
-        ):
-            record_assistant_feedback(message, "needs_work")
-            st.rerun()
-    else:
-        st.caption(f"Feedback recorded: {message['feedback']}")
 
 
 def render_copilot_message(message: dict[str, object], key_prefix: str) -> None:
@@ -3047,13 +3606,37 @@ def render_copilot_message(message: dict[str, object], key_prefix: str) -> None:
         st.markdown(content)
         if role == "assistant":
             render_copilot_details(message, key_prefix)
+            actions = st.columns([1, 1, 6])
+            if actions[0].button("Copy", key=f"{key_prefix}_copy", help="Copy answer"):
+                components.html(
+                    f"<script>navigator.clipboard.writeText({json.dumps(content)});</script>",
+                    height=0,
+                )
+                st.session_state.lyra_copy_notice = "Answer copied"
+            if actions[1].button("Retry", key=f"{key_prefix}_retry", help="Generate this answer again"):
+                messages = list(st.session_state.assistant_messages)
+                message_index = next(
+                    (index for index, item in enumerate(messages) if item.get("id") == message.get("id")),
+                    -1,
+                )
+                previous = next(
+                    (item for item in reversed(messages[:message_index]) if item.get("role") == "user"),
+                    None,
+                )
+                if previous:
+                    st.session_state.lyra_retry_prompt = str(previous.get("content", ""))
+                    st.session_state.assistant_messages = messages[:message_index]
+                    CONVERSATIONS.replace(
+                        st.session_state.lyra_conversation_token,
+                        st.session_state.assistant_messages,
+                    )
+                    st.rerun()
 
 
 def run_copilot_prompt(
     prompt: str,
     records: list[dict[str, object]],
     *,
-    selected_mode: str,
     key_prefix: str,
 ) -> None:
     prior_messages = list(st.session_state.assistant_messages)
@@ -3061,62 +3644,170 @@ def run_copilot_prompt(
         "id": f"user-{uuid.uuid4().hex[:10]}",
         "role": "user",
         "content": prompt,
-        "mode": selected_mode,
     }
     st.session_state.assistant_messages.append(user_message)
-    context = build_copilot_context(records)
-    effective_mode = selected_mode
-    follow_up_terms = ("it", "that", "same", "what about", "then", "this")
-    if selected_mode == "Auto" and len(prompt.split()) <= 10 and any(
-        term in prompt.lower() for term in follow_up_terms
+    CONVERSATIONS.replace(st.session_state.lyra_conversation_token, st.session_state.assistant_messages)
+    if (
+        assistant_requests_browser_inspection(prompt)
+        and st.session_state.assistant_allow_browser_inspection
     ):
-        previous_assistant = next(
-            (
-                message
-                for message in reversed(prior_messages)
-                if str(message.get("role", "")) == "assistant"
-            ),
-            {},
+        st.session_state.assistant_browser_snapshot = inspect_chrome_page(
+            include_screenshot="screenshot" in prompt.lower(),
+            screenshot_dir=APP_DIR / "outputs" / "assistant",
         )
-        previous_mode = str(previous_assistant.get("mode", "Auto"))
-        if previous_mode in {"Ask", "Diagnose", "Configure", "Support"}:
-            effective_mode = previous_mode
-    baseline = create_local_reply(prompt, effective_mode, context)
+    context = build_copilot_context(records, prompt)
+    previous_assistant = next(
+        (
+            message
+            for message in reversed(prior_messages)
+            if str(message.get("role", "")) == "assistant"
+        ),
+        {},
+    )
+    plan = plan_assistant_turn(
+        prompt,
+        context,
+        previous_intent=str(previous_assistant.get("intent", "")),
+    )
 
     with st.chat_message("user"):
         st.markdown(prompt)
     with st.chat_message("assistant"):
-        content = baseline.text
-        if st.session_state.assistant_use_model and openai_api_key_available():
-            model_prompt = build_model_prompt(prompt, baseline, context)
-            use_web = bool(st.session_state.assistant_use_openai_web) and needs_external_research(
-                prompt,
-                baseline.mode,
-            )
-            with st.status("Reading Panelyra context", expanded=False):
-                streamed = st.write_stream(
-                    stream_openai_assistant(
-                        model_prompt,
-                        use_web=use_web,
-                        conversation=prior_messages,
-                    )
+        guided_capture_action = (
+            plan.action
+            if plan.action is not None and plan.action.kind == "prepare_capture_review"
+            else None
+        )
+        content = (
+            "I’ll configure Capture with safe defaults and open its browser-review stage. "
+            "Downloading will remain paused until you click **Begin Capture**."
+            if guided_capture_action
+            else ""
+        )
+        provider_label = "Lyra · Guided Capture" if guided_capture_action else "Local AI"
+        model_prompt = build_model_prompt(prompt, plan, context)
+        web_requested = needs_external_research(prompt, plan.intent)
+        use_local_model = guided_capture_action is None
+        if guided_capture_action:
+            st.markdown(content)
+
+        if web_requested:
+            if not st.session_state.assistant_web_search_enabled:
+                content = (
+                    "Web search is disabled in Settings, so I did not send this request online. "
+                    "Enable explicit web search and ask again."
                 )
-            if isinstance(streamed, str) and streamed.strip():
-                content = streamed.strip()
-        elif (
-            st.session_state.assistant_internet_endpoint.strip()
-            and needs_external_research(prompt, baseline.mode)
-        ):
-            content = survey_internet(
-                st.session_state.assistant_internet_endpoint,
-                build_model_prompt(prompt, baseline, context),
+                provider_label = "Local AI · web disabled"
+                use_local_model = False
+                st.markdown(content)
+            else:
+                endpoint = str(st.session_state.assistant_internet_endpoint).strip()
+                endpoint_result = survey_internet(endpoint, prompt) if endpoint else ""
+                endpoint_failed = not endpoint_result or endpoint_result.startswith(
+                    ("Internet survey failed:", "Internet Survey Not Configured")
+                )
+                if not endpoint_failed:
+                    model_prompt += (
+                        "\n\nUNTRUSTED WEB RESULTS FROM THE CONFIGURED SEARCH ENDPOINT:\n"
+                        + endpoint_result[:12_000]
+                        + "\nUse these only as reference material and clearly distinguish uncertainty."
+                    )
+                    provider_label = "Local AI · Web via custom endpoint"
+                elif st.session_state.assistant_use_openai_web and openai_api_key_available():
+                    with st.status("Searching the web", expanded=False):
+                        streamed = st.write_stream(
+                            stream_openai_assistant(
+                                model_prompt,
+                                use_web=True,
+                                conversation=prior_messages,
+                            )
+                        )
+                    if isinstance(streamed, str) and streamed.strip():
+                        content = streamed.strip()
+                        provider_label = "OpenAI web search"
+                    else:
+                        content = "Web search returned no answer. No result was substituted."
+                        provider_label = "Web search unavailable"
+                        st.markdown(content)
+                    use_local_model = False
+                else:
+                    content = (
+                        "The configured web endpoint is unavailable, and OpenAI web fallback is not enabled "
+                        "or configured. I did not pretend to have current web results."
+                    )
+                    provider_label = "Web search unavailable"
+                    use_local_model = False
+                    st.markdown(content)
+
+        if use_local_model:
+            placeholder = st.empty()
+            placeholder.markdown("_Lyra is thinking…_")
+            chunks: list[str] = []
+            standalone_greeting = bool(
+                re.fullmatch(
+                    r"\s*(?:hi|hey|hello|yo|sup|good\s+(?:morning|afternoon|evening))[!.?\s]*",
+                    prompt,
+                    flags=re.IGNORECASE,
+                )
             )
-            st.markdown(content)
-        else:
-            st.markdown(content)
-        message = copilot_message_from_reply(baseline, content)
+            if standalone_greeting:
+                model_prompt = (
+                    f"The user's entire message is: {prompt!r}. Reply only with a short, natural greeting "
+                    "and a simple question asking how you can help. Do not mention Panelyra, Lyra, a library, "
+                    "books, data, context, the site, or your capabilities. Do not add any unrelated information."
+                )
+            try:
+                for chunk in LOCAL_MODEL_CLIENT.stream_chat(
+                    model=str(st.session_state.assistant_local_model),
+                    system_prompt=PANELYRA_SYSTEM_PROMPT,
+                    conversation=[] if standalone_greeting else prior_messages,
+                    prompt=model_prompt,
+                ):
+                    chunks.append(chunk)
+                    placeholder.markdown("".join(chunks))
+                if chunks and "".join(chunks).strip():
+                    content = "".join(chunks).strip()
+            except LocalModelError as exc:
+                if chunks:
+                    content = "".join(chunks).strip() + f"\n\n_Local AI stopped early: {exc}_"
+                    provider_label += " · partial"
+                    placeholder.markdown(content)
+                else:
+                    content = "Local AI became unavailable before it could answer. Retry the connection and ask again."
+                    provider_label = "Local AI unavailable"
+                    placeholder.markdown(content)
+                    st.caption(str(exc))
+
+        message = copilot_message_from_plan(plan, content, provider_label)
+        message["status"] = "partial" if "partial" in provider_label.lower() else "complete"
         st.session_state.assistant_messages.append(message)
+        CONVERSATIONS.replace(st.session_state.lyra_conversation_token, st.session_state.assistant_messages)
+        if st.session_state.page != "Assistant":
+            CONVERSATIONS.mark_unread(st.session_state.lyra_conversation_token)
+            st.session_state.lyra_unread = True
         render_copilot_details(message, f"{key_prefix}_{message['id']}")
+        if guided_capture_action is not None:
+            outcome = execute_copilot_action(
+                {"kind": guided_capture_action.kind, "payload": dict(guided_capture_action.payload)}
+            )
+            outcome_message = {
+                "id": f"assistant-capture-{uuid.uuid4().hex[:10]}",
+                "role": "assistant",
+                "content": outcome,
+                "intent": "Configure",
+                "confidence": "high",
+                "provider": "Panelyra validation",
+                "evidence": [],
+                "action": None,
+                "status": "waiting" if st.session_state.lyra_capture_prepared else "needs-attention",
+            }
+            st.session_state.assistant_messages.append(outcome_message)
+            CONVERSATIONS.replace(
+                st.session_state.lyra_conversation_token,
+                st.session_state.assistant_messages,
+            )
+    if guided_capture_action is not None:
+        st.rerun()
 
 
 def render_copilot_chat(
@@ -3130,92 +3821,138 @@ def render_copilot_chat(
         st.success(notice)
         st.session_state.assistant_action_notice = ""
 
-    st.markdown(
-        """
-        <style>
-        .st-key-assistant_mode div[role="radiogroup"] {
-            display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
-            gap: 4px;
-            padding: 4px;
-            border: 1px solid rgba(255,255,255,0.10);
-            border-radius: 10px;
-            background: rgba(8,10,14,0.78);
-        }
-        .st-key-assistant_mode div[role="radiogroup"] label {
-            justify-content: center;
-            min-height: 36px;
-            margin: 0;
-            padding: 6px 8px;
-            border-radius: 7px;
-            transition: background 160ms ease, box-shadow 160ms ease;
-        }
-        .st-key-assistant_mode div[role="radiogroup"] label:has(input:checked) {
-            background: linear-gradient(180deg, #30343d, #22252c);
-            box-shadow: inset 0 1px rgba(255,255,255,0.12), 0 5px 16px rgba(0,0,0,0.28);
-        }
-        .st-key-assistant_mode div[role="radiogroup"] label > div:first-child {
-            display: none;
-        }
-        @media (max-width: 720px) {
-            .st-key-assistant_mode div[role="radiogroup"] {
-                grid-template-columns: repeat(3, minmax(0, 1fr));
-            }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
+    if st.session_state.lyra_copy_notice:
+        st.toast(st.session_state.lyra_copy_notice)
+        st.session_state.lyra_copy_notice = ""
+    model_status = LOCAL_MODEL_CLIENT.status()
+    ready = (
+        bool(st.session_state.assistant_use_model)
+        and model_status.available
+        and str(st.session_state.assistant_local_model) in model_status.models
     )
-    selected_mode = st.radio(
-        "Assistant mode",
-        options=["Auto", "Ask", "Diagnose", "Configure", "Support"],
-        index=0,
-        horizontal=True,
-        key="assistant_mode",
-    )
+    if not ready:
+        st.warning(
+            (f"The selected model {st.session_state.assistant_local_model} is not installed. Choose an installed model in Settings → AI."
+             if model_status.available else model_status.message)
+            if st.session_state.assistant_use_model
+            else "Local AI answers are disabled in Settings."
+        )
+        if st.button("Open AI settings", key=f"{key_prefix}_open_ai_settings"):
+            set_page("Settings")
+            st.session_state.settings_view = "AI"
+            st.rerun()
+        if st.button("Retry connection", key=f"{key_prefix}_retry_connection", width="stretch"):
+            st.rerun()
+        for index, message in enumerate(st.session_state.assistant_messages[-history_limit:]):
+            render_copilot_message(message, f"{key_prefix}_offline_{message.get('id', index)}")
+        return
+
     if not st.session_state.assistant_messages:
-        suggestions = {
-            "Auto": "Ask a question or describe what is failing.",
-            "Ask": "Try: What does Capture save and where?",
-            "Diagnose": "Try: Why did the latest downloader run fail?",
-            "Configure": "Try: Configure Capture for this URL and 5 chapters.",
-            "Support": "Try: Draft a reply to a user whose download stopped.",
+        st.markdown(
+            '<div class="lyra-welcome" data-testid="lyra-welcome">'
+            '<div class="lyra-orb"><span class="lyra-glyph" aria-hidden="true"></span></div><h2>How can I help?</h2>'
+            '<p>I can explain this page, diagnose a stopped run, or help you choose safe settings.</p></div>',
+            unsafe_allow_html=True,
+        )
+        context_prompts = {
+            "Dashboard": ("What can I create with Panelyra?", "Which workspace should I start with?"),
+            "Capture": ("What will Capture save?", "Help me choose the Capture options."),
+            "Engage": ("How does comment testing work?", "Why did the latest Engage run stop?"),
+            "Reader": ("How do I find and read a series?", "Why is a chapter missing?"),
         }
-        st.info(suggestions.get(selected_mode, suggestions["Auto"]))
+        starters = context_prompts.get(
+            str(st.session_state.page),
+            ("What does this page do?", "Why did the latest run stop?"),
+        ) + ("Help me fix this error.",)
+        columns = st.columns(len(starters))
+        for index, starter in enumerate(starters):
+            if columns[index].button(
+                starter,
+                key=f"{key_prefix}_starter_{index}",
+                width="stretch",
+            ):
+                run_copilot_prompt(starter, records, key_prefix=key_prefix)
     for index, message in enumerate(st.session_state.assistant_messages[-history_limit:]):
         render_copilot_message(message, f"{key_prefix}_{message.get('id', index)}")
 
+    retry_prompt = str(st.session_state.lyra_retry_prompt).strip()
+    if retry_prompt:
+        st.session_state.lyra_retry_prompt = ""
+        run_copilot_prompt(retry_prompt, records, key_prefix=key_prefix)
+    response_slot = st.container(key=f"{key_prefix}_response_slot")
     prompt = st.chat_input(
-        "Ask Panelyra, diagnose a run, configure a workflow, or help a user...",
+        f"Ask Lyra about {str(st.session_state.page).lower()}...",
         key=f"{key_prefix}_chat_input",
     )
     if prompt and prompt.strip():
-        run_copilot_prompt(
-            prompt.strip(),
-            records,
-            selected_mode=str(selected_mode),
-            key_prefix=key_prefix,
-        )
+        with response_slot:
+            run_copilot_prompt(prompt.strip(), records, key_prefix=key_prefix)
 
 
-def render_floating_chat_widget(records: list[dict[str, object]], status_label: str) -> None:
-    if not st.session_state.assistant_enabled or st.session_state.page == "Assistant":
+def select_lyra_thread(token: str) -> None:
+    selected = CONVERSATIONS.select_thread(token)
+    if selected is None:
         return
+    st.session_state.lyra_conversation_token = token
+    st.session_state.assistant_messages = list(selected.get("messages", []))
+    st.session_state.lyra_synced_messages = list(st.session_state.assistant_messages)
+    st.session_state.lyra_unread = False
 
-    readiness = "Model ready" if openai_api_key_available() else "Local copilot"
-    with st.popover("AI", width="stretch"):
-        st.markdown("### Panelyra Copilot")
-        st.caption(
-            f"{readiness} · page {st.session_state.page} · {status_label.lower()}"
-        )
-        controls = st.columns(2)
-        if controls[0].button("Open full page", key="assistant_open_page", width="stretch"):
-            set_page("Assistant")
+
+def create_lyra_thread() -> None:
+    token = CONVERSATIONS.create_thread(
+        context={"page": str(st.session_state.page)},
+        model=str(st.session_state.assistant_local_model),
+    )
+    select_lyra_thread(token)
+    st.session_state.assistant_run_context = {}
+    st.session_state.assistant_browser_snapshot = {}
+
+
+def render_lyra_thread_rail() -> None:
+    st.markdown('<div data-testid="lyra-thread-list"></div>', unsafe_allow_html=True)
+    heading, collapse = st.columns([5, 1])
+    heading.markdown("#### Conversations")
+    if collapse.button("‹", key="lyra_collapse_threads", help="Hide conversation history"):
+        st.session_state.lyra_thread_rail_open = False
+        st.rerun()
+    if st.button("＋ New conversation", key="lyra_new_thread", type="primary", width="stretch"):
+        create_lyra_thread()
+        st.rerun()
+    threads = CONVERSATIONS.list_threads()
+    current = str(st.session_state.lyra_conversation_token)
+    for index, thread in enumerate(threads):
+        token = str(thread.get("token", ""))
+        selected = token == current
+        unread = " •" if thread.get("unread") else ""
+        label = f"{'● ' if selected else ''}{thread.get('title', 'New conversation')}{unread}"
+        if st.button(
+            label,
+            key=f"lyra_thread_{index}_{token[:8]}",
+            width="stretch",
+            disabled=selected,
+            help=f"{int(thread.get('message_count', 0))} messages",
+        ):
+            select_lyra_thread(token)
             st.rerun()
-        if controls[1].button("Clear chat", key="assistant_clear_chat", width="stretch"):
-            st.session_state.assistant_messages = []
-            st.rerun()
-        render_copilot_chat(records, key_prefix="floating_copilot", history_limit=6)
+    selected_thread = next((thread for thread in threads if thread.get("token") == current), None)
+    if selected_thread:
+        with st.expander("Manage this conversation", expanded=False):
+            title = st.text_input(
+                "Conversation name",
+                value=str(selected_thread.get("title", "New conversation")),
+                key=f"lyra_rename_{current[:8]}",
+            )
+            manage = st.columns(2)
+            if manage[0].button("Rename", key="lyra_rename_thread", width="stretch"):
+                CONVERSATIONS.rename_thread(current, title)
+                st.rerun()
+            if manage[1].button("Delete", key="lyra_delete_thread", width="stretch"):
+                CONVERSATIONS.delete_thread(current)
+                create_lyra_thread()
+                st.rerun()
+
+
 
 
 def render_next_step(status_label: str) -> None:
@@ -3422,32 +4159,17 @@ def apply_ocr_download_defaults(force: bool = False) -> None:
 
 PAGES = [page for pages in NAVIGATION_GROUPS.values() for page in pages]
 WORKSPACE_VIEW_ROUTES = {
-    "Engage": {
-        "Configure": "Engage Setup",
-        "Live": "Engage Live",
-        "Results": "Engage Insights",
-    },
-    "Capture": {
-        "Configure": "Capture Setup",
-        "Live": "Capture Live",
-        "Results": "Capture Library",
-    },
-    "Studio": {
-        "Configure": "Studio Setup",
-        "Live": "Studio Live",
-        "Results": "Studio Library",
-    },
-    "Settings": {
-        "General": "Settings",
-        "Storage": "Storage",
-    },
+    "Engage": {"Configure": "Engage Setup", "Live": "Engage Live", "Results": "Engage Insights"},
+    "Capture": {"Configure": "Capture Setup", "Live": "Capture Live"},
+    "Settings": {"General": "Settings", "Connections": "Settings", "Storage": "Storage", "Help": "Settings"},
 }
 LEGACY_PAGE_ROUTES = {
-    route: (workspace, view)
-    for workspace, views in WORKSPACE_VIEW_ROUTES.items()
-    for view, route in views.items()
+    "Reader": ("Library", ""), "Dashboard": ("Library", ""), "Overview": ("Library", ""),
+    "Capture Library": ("Library", ""), "Run History": ("Activity", ""), "Assistant": ("Library", ""), "Lyra": ("Library", ""),
+    "Help": ("Settings", "Help"), "Storage": ("Settings", "Storage"), "Cleaner": ("Library", ""),
+    **{route: (workspace, view) for workspace, views in WORKSPACE_VIEW_ROUTES.items()
+       for view, route in views.items() if route != "Settings"},
 }
-LEGACY_PAGE_ROUTES["Overview"] = ("Dashboard", "")
 
 
 def request_scroll_to_top() -> None:
@@ -3456,6 +4178,13 @@ def request_scroll_to_top() -> None:
 
 def set_page(page: str) -> None:
     previous_page = str(st.session_state.get("page", ""))
+    if page in {"Lyra", "Assistant"}:
+        st.session_state.route_notice = "AI has been removed from Panelyra. Saved conversations are preserved on disk."
+        page = "Library"
+    if page.startswith("Studio"):
+        st.session_state.route_notice = "Studio has been retired. Existing files and historical runs are preserved."
+        page = "Library"
+    st.session_state.library_trim = page == "Cleaner"
     if page in LEGACY_PAGE_ROUTES:
         workspace, view = LEGACY_PAGE_ROUTES[page]
         st.session_state.page = workspace
@@ -3464,7 +4193,7 @@ def set_page(page: str) -> None:
         if previous_page != workspace:
             request_scroll_to_top()
         return
-    destination = page if page in PAGES else "Dashboard"
+    destination = page if page in PAGES else "Library"
     st.session_state.page = destination
     if previous_page != destination:
         request_scroll_to_top()
@@ -3511,24 +4240,23 @@ def render_scroll_to_top_trigger() -> None:
 
 
 def render_workspace_view(page: str) -> str:
-    if page == "Dashboard":
-        return "Overview"
     views = WORKSPACE_VIEW_ROUTES.get(page)
     if not views:
         return page
     state_key = f"{page.lower()}_view"
     selected = str(st.session_state.get(state_key, next(iter(views))))
-    view_columns = st.columns(len(views))
-    for column, view in zip(view_columns, views):
-        if column.button(
-            view,
-            key=f"{page.lower()}_view_button_{view.lower()}",
-            type="primary" if view == selected else "secondary",
-            width="stretch",
-        ):
-            st.session_state[state_key] = view
-            request_scroll_to_top()
-            st.rerun()
+    if selected not in views:
+        selected = next(iter(views))
+        st.session_state[state_key] = selected
+    with st.container(key="workspace_views"):
+        chosen = st.radio(
+            "View", list(views), key=state_key,
+            horizontal=True, label_visibility="collapsed",
+            index=0,  # Keep widget identity stable when the selected view changes.
+            format_func=lambda value: "Setup" if value == "Configure" else value,
+            on_change=request_scroll_to_top,
+        )
+        selected = chosen or next(iter(views))
     return views.get(selected, next(iter(views.values())))
 
 
@@ -3600,12 +4328,28 @@ def initialize_session_state() -> None:
         "reader_series": "",
         "reader_edition": "Original",
         "reader_chapter": "",
+        "reader_clean_review": {},
+        "reader_clean_batch": [],
         "assistant_open": False,
         "assistant_messages": [],
+        "lyra_conversation_token": "",
+        "lyra_synced_messages": [],
         "assistant_prompt": "",
         "assistant_browser_snapshot": {},
         "assistant_action_notice": "",
         "assistant_selected_ticket": "",
+        "assistant_run_context": {},
+        "lyra_thread_rail_open": True,
+        "lyra_unread": False,
+        "lyra_copy_notice": "",
+        "lyra_retry_prompt": "",
+        "lyra_capture_prepared": False,
+        "lyra_capture_review_status": "",
+        "lyra_capture_browser_snapshot": {},
+        "lyra_capture_expected_url": "",
+        "progress_samples": {},
+        "progress_previous": {},
+        "progress_announcements": {},
         "engage_view": "Configure",
         "capture_view": "Configure",
         "studio_view": "Configure",
@@ -3621,17 +4365,17 @@ def initialize_session_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    if str(st.session_state.progress_animation) not in {"Full", "Subtle", "Off"}:
+        st.session_state.progress_animation = "Subtle"
     apply_ocr_download_defaults()
-    if st.session_state.default_landing_page == "Overview":
-        st.session_state.default_landing_page = "Dashboard"
+    landing = str(st.session_state.default_landing_page)
+    st.session_state.default_landing_page = LEGACY_PAGE_ROUTES.get(landing, (landing, ""))[0]
     if st.session_state.default_landing_page not in PAGES:
-        st.session_state.default_landing_page = "Dashboard"
+        st.session_state.default_landing_page = "Library"
     if "page" not in st.session_state:
         st.session_state.page = st.session_state.default_landing_page
-    elif st.session_state.page in LEGACY_PAGE_ROUTES:
-        set_page(str(st.session_state.page))
     elif st.session_state.page not in PAGES:
-        st.session_state.page = "Dashboard"
+        set_page(str(st.session_state.page))
 
 
 def restore_active_runtime_references() -> None:
@@ -3656,15 +4400,42 @@ def restore_active_runtime_references() -> None:
 
 
 st.set_page_config(
-    page_title=f"{PRODUCT_NAME} Control",
+    page_title=PRODUCT_NAME,
     page_icon="P",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 initialize_session_state()
+try:
+    requested_page = st.query_params.get("page")
+    if requested_page:
+        set_page(str(requested_page))
+    requested_series = st.query_params.get("series")
+    requested_chapter = st.query_params.get("chapter")
+    requested_edition = st.query_params.get("edition")
+    if requested_series:
+        st.session_state.reader_series = str(requested_series)
+    if requested_chapter:
+        st.session_state.reader_chapter = str(requested_chapter)
+    if requested_edition in {"Original", "Clean"}:
+        st.session_state.reader_edition = str(requested_edition)
+    if requested_page:
+        st.session_state.pop("reader_book_choice", None)
+        for query_key in ("page", "series", "chapter", "edition"):
+            if query_key in st.query_params:
+                del st.query_params[query_key]
+except (AttributeError, TypeError):
+    pass
+# AI has been removed from the product. Existing conversation files stay untouched.
+st.session_state.assistant_use_model = False
+st.session_state.show_lyra_in_immersive_reader = False
+st.session_state.lyra_conversation_token = ""
 restore_active_runtime_references()
 preserve_wizard_state()
 inject_styles()
+from panelyra.screens.theme import inject_theme
+inject_theme()
+st.html(PROGRESS_CSS)
 render_scroll_to_top_trigger()
 
 running_bots = {
@@ -3686,14 +4457,38 @@ def runtime_status(bot_type: str) -> str:
 
 
 def load_runtime_record(bot_type: str) -> dict[str, object]:
+    runtime = st.session_state.bot_runtimes.get(bot_type, {})
+    process = runtime.get("process")
+    process_pid = int(getattr(process, "pid", 0) or 0)
     path_value = st.session_state.run_record_paths.get(bot_type)
-    if not path_value:
-        return {}
-    try:
-        payload = json.loads(Path(path_value).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    payload: dict[str, object] = {}
+    if path_value:
+        try:
+            candidate = json.loads(Path(path_value).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            candidate = {}
+        if isinstance(candidate, dict) and str(candidate.get("bot_type", "")) == bot_type:
+            payload = candidate
+
+    records = list_run_records(limit=100)
+    if process_pid:
+        pid_match = next(
+            (
+                record
+                for record in records
+                if str(record.get("bot_type", "")) == bot_type
+                and int(record.get("pid", 0) or 0) == process_pid
+            ),
+            None,
+        )
+        if isinstance(pid_match, dict):
+            return pid_match
+    if payload:
+        return payload
+    return next(
+        (record for record in records if str(record.get("bot_type", "")) == bot_type),
+        {},
+    )
 
 
 def format_elapsed(seconds: int) -> str:
@@ -3717,6 +4512,520 @@ def estimate_remaining(record: dict[str, object]) -> str:
     return format_elapsed(round((elapsed / current) * (total - current)))
 
 
+PROGRESS_WORKSPACES = {
+    "comment": ("engage", "Engage"),
+    "download": ("capture", "Capture"),
+    "word_art": ("studio", "Studio"),
+}
+
+
+def safe_progress_int(value: object, default: int = 0) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return max(0, int(default))
+
+
+def parse_local_timestamp(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+
+def run_history_records(started_at: int) -> list[dict[str, object]]:
+    records = []
+    for record in read_history():
+        timestamp = parse_local_timestamp(record.get("timestamp"))
+        if timestamp is not None and timestamp >= max(0, started_at - 1):
+            records.append(record)
+    return records
+
+
+def timestamped_progress_events(log_text: str, workspace: str) -> list[float]:
+    if workspace == "capture":
+        marker = re.compile(r"OCR downloading chapter\s+\d+\s*/\s*\d+", re.IGNORECASE)
+    elif workspace == "engage":
+        marker = re.compile(
+            r"Chapter submission (?:completed|unverified):\s*\d+\s*/\s*\d+",
+            re.IGNORECASE,
+        )
+    else:
+        return []
+    values: list[float] = []
+    for line in log_text.splitlines():
+        if not marker.search(line):
+            continue
+        match = re.match(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+", line)
+        if match:
+            timestamp = parse_local_timestamp(match.group(1))
+            if timestamp is not None:
+                values.append(timestamp)
+    return values
+
+
+def sample_progress_history(run_id: str, current: int, total: int) -> tuple[float, ...]:
+    if not run_id or total <= 0:
+        return tuple()
+    samples_by_run = st.session_state.setdefault("progress_samples", {})
+    samples = list(samples_by_run.get(run_id, []))
+    now = time.time()
+    fraction = min(1.0, max(0.0, current / max(1, total)))
+    if not samples or samples[-1][1] != current or now - float(samples[-1][0]) >= 5.0:
+        samples.append((now, current, fraction))
+        samples = samples[-36:]
+        samples_by_run[run_id] = samples
+    return tuple(float(sample[2]) for sample in samples)
+
+
+def estimate_progress_eta(
+    *,
+    state: str,
+    workspace: str,
+    current: int,
+    total: int,
+    started_at: int,
+    log_text: str,
+    history_records: list[dict[str, object]],
+    run_id: str,
+) -> tuple[str, str]:
+    if state == "completed":
+        return "Complete", "Measured from this run"
+    if state in {"failed", "stopped"}:
+        return "—", "Run is no longer active"
+    if workspace == "studio":
+        return "Short run", "Stage-based workflow"
+    if total <= 0 or current <= 0:
+        return "Calculating", "Waiting for a completed step"
+    remaining = max(0, total - current)
+    if remaining == 0:
+        return "Finishing", "Verifying the final step"
+
+    event_times: list[float] = []
+    if workspace == "engage":
+        event_times = [
+            timestamp
+            for item in history_records
+            if str(item.get("status", "")).lower() in {"submitted", "unverified"}
+            for timestamp in [parse_local_timestamp(item.get("timestamp"))]
+            if timestamp is not None
+        ]
+    if len(event_times) < 2:
+        event_times = timestamped_progress_events(log_text, workspace)
+    if len(event_times) < 2:
+        samples = list(st.session_state.get("progress_samples", {}).get(run_id, []))
+        event_times = [float(sample[0]) for sample in samples]
+    intervals = [
+        later - earlier
+        for earlier, later in zip(event_times, event_times[1:])
+        if later > earlier
+    ]
+    if not intervals:
+        return "Stabilizing", "Learning this run's pace"
+    recent_intervals = intervals[-6:]
+    remaining_seconds = max(1, round(median(recent_intervals) * remaining))
+    confidence = "Stable pace" if len(recent_intervals) >= 3 else "Early estimate"
+    return f"About {format_elapsed(remaining_seconds)}", confidence
+
+
+def format_freshness(age_seconds: float | None) -> str:
+    if age_seconds is None:
+        return "when the run starts"
+    age = max(0, int(age_seconds))
+    if age < 5:
+        return "just now"
+    if age < 60:
+        return f"{age}s ago"
+    if age < 3600:
+        return f"{age // 60}m ago"
+    return f"{age // 3600}h ago"
+
+
+def capture_output_ready(output_path: Path, started_at: int) -> bool:
+    if not output_path.is_dir():
+        return False
+    try:
+        metadata_paths = output_path.rglob("metadata.json")
+        for metadata_path in metadata_paths:
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            saved_at = safe_progress_int(metadata.get("saved_at_epoch")) if isinstance(metadata, dict) else 0
+            if saved_at and saved_at >= max(0, started_at - 1):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def resolved_progress_output(
+    bot_type: str,
+    record: dict[str, object],
+    started_at: int,
+) -> tuple[Path | None, bool]:
+    settings = record.get("settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+    if bot_type == "download":
+        path_value = str(
+            settings.get("output_dir")
+            or st.session_state.get("ocr_custom_output_dir")
+            or OCR_DOWNLOAD_DIR
+        ).strip()
+        output_path = Path(path_value).expanduser()
+        if not output_path.is_absolute():
+            output_path = APP_DIR / output_path
+        return output_path, capture_output_ready(output_path, started_at)
+    if bot_type == "word_art":
+        image_value = str(settings.get("image_path") or st.session_state.get("studio_preview_path", "")).strip()
+        candidates = []
+        if image_value:
+            image_path = Path(image_value).expanduser()
+            candidates.append(image_path if image_path.is_absolute() else APP_DIR / image_path)
+        try:
+            candidates.extend(
+                sorted(UPLOAD_DIR.glob("*-word-art.png"), key=lambda item: item.stat().st_mtime, reverse=True)
+            )
+        except OSError:
+            pass
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and candidate.stat().st_mtime >= max(0, started_at - 1):
+                    return candidate, True
+            except OSError:
+                continue
+        return (candidates[0], False) if candidates else (None, False)
+    return (HISTORY_FILE, HISTORY_FILE.is_file())
+
+
+def progress_stage_label(workspace: str, stage: str, message: str, state: str) -> str:
+    if state == "completed":
+        return "Ready for review" if workspace == "studio" else "Run complete"
+    if state == "failed":
+        return "Run needs attention"
+    if state == "stopped":
+        return "Stopped early"
+    if state == "paused":
+        return "Paused at the current step"
+    if state == "waiting":
+        return "Your browser is ready for you"
+    normalized = stage.strip().lower()
+    workspace_labels = {
+        "engage": {
+            "created": "Preparing the comment run",
+            "process-started": "Starting the local runner",
+            "opening-browser": "Opening the browser",
+            "scanning": "Reading the current chapter",
+            "generated": "Preparing a contextual comment",
+            "verified": "Submission verified",
+            "unverified": "Checking the submitted comment",
+            "recovering": "Recovering the browser session",
+        },
+        "capture": {
+            "created": "Preparing chapter capture",
+            "process-started": "Starting the local runner",
+            "opening-browser": "Opening the reader",
+            "waiting-for-user": "Confirm the reader in the browser",
+            "scanning": "Scanning reader pages",
+            "saving-images": "Saving original reader images",
+            "ocr": "Reading page text locally",
+        },
+        "studio": {
+            "created": "Preparing the composition",
+            "process-started": "Starting the local runner",
+            "opening-browser": "Opening the editor",
+            "uploading": "Uploading the rendered composition",
+            "editing": "Filling the editor",
+        },
+    }
+    fallback = workspace_labels.get(workspace, {}).get(normalized, normalized.replace("-", " ").title())
+    cleaned_message = redact_private_paths(message).strip()
+    return cleaned_message or fallback or "Preparing your run"
+
+
+def build_run_progress_model(
+    bot_type: str,
+    *,
+    surface: str = "live",
+) -> tuple[RunProgressModel, dict[str, object]]:
+    workspace, workspace_label = PROGRESS_WORKSPACES[bot_type]
+    runtime = st.session_state.bot_runtimes.get(bot_type, {})
+    process = runtime.get("process")
+    process_running = is_process_running(process)
+    return_code = process.poll() if process is not None else None
+    record = load_runtime_record(bot_type)
+    run_id = str(record.get("run_id", "") or f"{bot_type}-pending")
+    record_status = str(record.get("status", "") or ("running" if process_running else "starting"))
+    record_stage = str(record.get("stage", "") or "created")
+
+    log_value = record.get("log_path") or runtime.get("log_path")
+    log_path = Path(str(log_value)).expanduser() if log_value else None
+    log_text = (
+        read_log(log_path, int(st.session_state.console_max_chars))
+        if log_path is not None
+        else ""
+    )
+    lowered_log = log_text.lower()
+    wait_markers = {
+        "engage": "waiting for dashboard start signal",
+        "capture": "browser review is active",
+        "studio": "set up the note page manually",
+    }
+    continue_markers = {
+        "engage": "dashboard start signal received",
+        "capture": "capture start signal received",
+        "studio": "start signal received",
+    }
+    unmatched_wait = lowered_log.rfind(wait_markers[workspace]) > lowered_log.rfind(continue_markers[workspace])
+    waiting = bool(runtime.get("signal_path")) or record_stage == "waiting-for-user" or unmatched_wait
+    state = resolve_progress_state(
+        paused=bool(runtime.get("paused")) and process_running,
+        waiting=waiting and process_running,
+        running=process_running,
+        status=record_status,
+        stage=record_stage,
+        return_code=return_code,
+    )
+
+    started_at = safe_progress_int(record.get("started_at"))
+    updated_candidates = [safe_progress_int(record.get("updated_at"))]
+    if log_path is not None:
+        try:
+            updated_candidates.append(int(log_path.stat().st_mtime))
+        except OSError:
+            pass
+    last_updated_at = max(updated_candidates or [0])
+    last_update_age = time.time() - last_updated_at if last_updated_at else None
+    reconnecting = process_running and not record and not log_text
+    health = resolve_health(
+        state,
+        last_update_age,
+        refresh_seconds=float(st.session_state.auto_refresh_seconds),
+        stage=record_stage,
+        reconnecting=reconnecting,
+    )
+
+    settings = record.get("settings", {}) if isinstance(record.get("settings"), dict) else {}
+    history_records = run_history_records(started_at) if workspace == "engage" and started_at else []
+    submitted = sum(1 for item in history_records if str(item.get("status", "")).lower() == "submitted")
+    unverified = sum(1 for item in history_records if str(item.get("status", "")).lower() == "unverified")
+    engage_failures = sum(1 for item in history_records if str(item.get("status", "")).lower() == "failed")
+
+    current = safe_progress_int(record.get("progress_current"))
+    total = safe_progress_int(record.get("progress_total"))
+    detail_items: list[tuple[str, str]] = []
+    stage_markers: dict[str, bool] = {}
+    subprogress_label = ""
+    subprogress_current: int | None = None
+    subprogress_total: int | None = None
+    runtime_details: dict[str, object] = {}
+
+    if workspace == "engage":
+        fallback = parse_bot_progress(log_text)
+        if total <= 0:
+            total = safe_progress_int(fallback.get("target"))
+        if not record and current <= 0:
+            current = submitted + unverified
+        failures = engage_failures or safe_progress_int(fallback.get("failures"))
+        detail_items = [
+            ("Submitted", str(submitted)),
+            ("Unverified", str(unverified)),
+            ("Failures", str(failures)),
+        ]
+        if current > 0:
+            subprogress_label = "Verified submissions"
+            subprogress_current = submitted
+            subprogress_total = current
+        stage_markers = {
+            "scan": "extracted chapter context" in lowered_log,
+            "submit": "chapter submission" in lowered_log,
+            "verify": submitted > 0,
+        }
+        runtime_details.update({"submitted": submitted, "unverified": unverified, "failures": failures})
+    elif workspace == "capture":
+        fallback = parse_ocr_progress(log_text)
+        if total <= 0:
+            total = safe_progress_int(fallback.get("target"))
+        reader_matches = re.findall(
+            r"Reader media progress:\s*page\s+(\d+)\s*/\s*(\d+|\?)\s*,\s*(\d+)\s+unique image(?:s)?",
+            log_text,
+            re.IGNORECASE,
+        )
+        reader_current = safe_progress_int(reader_matches[-1][0]) if reader_matches else 0
+        reader_total = safe_progress_int(reader_matches[-1][1]) if reader_matches and reader_matches[-1][1] != "?" else 0
+        reader_images = safe_progress_int(reader_matches[-1][2]) if reader_matches else 0
+        saved_matches = re.findall(r"Saved\s+(\d+)\s*/\s*(\d+)\s+raw image", log_text, re.IGNORECASE)
+        saved_current = safe_progress_int(saved_matches[-1][0]) if saved_matches else reader_images
+        saved_total = safe_progress_int(saved_matches[-1][1]) if saved_matches else 0
+        failures = safe_progress_int(fallback.get("failures"))
+        reader_value = f"{reader_current} / {reader_total}" if reader_total else (str(reader_current) if reader_current else "Waiting")
+        saved_value = f"{saved_current} / {saved_total}" if saved_total else str(saved_current)
+        detail_items = [
+            ("Reader page", reader_value),
+            ("Images found", saved_value),
+            ("Failures", str(failures)),
+        ]
+        if reader_current:
+            subprogress_label = "Current reader page"
+            subprogress_current = reader_current
+            subprogress_total = reader_total or None
+        stage_markers = {
+            "browser": "opening" in lowered_log or "browser review" in lowered_log,
+            "scan": bool(reader_matches),
+            "save": bool(saved_matches),
+        }
+        runtime_details.update(
+            {
+                "reader_current": reader_current,
+                "reader_total": reader_total,
+                "saved_current": saved_current,
+                "saved_total": saved_total,
+                "failures": failures,
+            }
+        )
+    else:
+        upload_done = "WORD_ART_UPLOAD_VERIFIED" in log_text
+        editor_done = "WORD_ART_EDITOR_VERIFIED" in log_text
+        save_done = "WORD_ART_SAVE_VERIFIED" in log_text
+        review_only = bool(settings.get("skip_submit", st.session_state.note_skip_submit))
+        total = 2 if review_only else 3
+        current = int(upload_done) + int(editor_done) + (0 if review_only else int(save_done))
+        if state == "completed":
+            current = total
+        detail_items = [
+            ("Upload", "Verified" if upload_done else "Waiting"),
+            ("Editor", "Verified" if editor_done else "Waiting"),
+            ("Final action", "Review ready" if review_only and state == "completed" else ("Verified" if save_done else "Waiting")),
+        ]
+        stage_markers = {
+            "upload": upload_done,
+            "edit": editor_done,
+            "save": save_done,
+            "review-mode": review_only,
+        }
+        runtime_details.update(
+            {"upload_done": upload_done, "editor_done": editor_done, "save_done": save_done, "review_only": review_only}
+        )
+
+    total = max(total, current) if total > 0 else 0
+    history = sample_progress_history(run_id, current, total)
+    eta, eta_confidence = estimate_progress_eta(
+        state=state,
+        workspace=workspace,
+        current=current,
+        total=total,
+        started_at=started_at,
+        log_text=log_text,
+        history_records=history_records,
+        run_id=run_id,
+    )
+    detail_items.append(("ETA confidence", eta_confidence))
+    terminal = state in {"completed", "failed", "stopped"}
+    elapsed_end = safe_progress_int(record.get("updated_at")) if terminal else int(time.time())
+    elapsed = format_elapsed(max(0, elapsed_end - started_at)) if started_at else "—"
+
+    message = str(record.get("message") or record.get("stop_reason") or "")
+    stage_label = progress_stage_label(workspace, record_stage, message, state)
+    output_path, output_ready = resolved_progress_output(bot_type, record, started_at)
+    notice = ""
+    if state == "waiting":
+        notice = "Finish the browser check, then use the Continue control below."
+    elif state == "paused":
+        notice = "The local process is safely paused. Resume when you are ready."
+    elif state == "failed":
+        notice = redact_private_paths(str(record.get("stop_reason") or message or "Review Diagnostics before trying again."))
+    elif state == "stopped":
+        notice = redact_private_paths(str(record.get("stop_reason") or "This run stopped before every planned step finished."))
+    elif health == "slowing":
+        notice = "This step is taking longer than recent updates, but the process is still active."
+    elif health == "stalled":
+        notice = "No recent update was detected. Check the browser and Diagnostics before stopping the run."
+    elif health == "reconnecting":
+        notice = "The Mac process is still active while Panelyra reconnects to its run record."
+
+    receipt_title = ""
+    receipt_body = ""
+    receipt_items: list[tuple[str, str]] = []
+    if state == "completed":
+        if workspace == "engage":
+            receipt_title = "Comment run complete"
+            receipt_body = "Verified local history is ready in Engage Insights."
+            receipt_items = [("Processed", str(current)), ("Verified", str(submitted)), ("Elapsed", elapsed)]
+        elif workspace == "capture":
+            receipt_title = "Capture complete"
+            receipt_body = "The chapter output was verified and is ready in the local library." if output_ready else "The run finished; verify the output from Capture Library."
+            receipt_items = [("Chapters", str(current)), ("Output", "Verified" if output_ready else "Check output"), ("Elapsed", elapsed)]
+        else:
+            review_only = bool(runtime_details.get("review_only"))
+            receipt_title = "Ready for review" if review_only else "Studio run complete"
+            receipt_body = "The editor remains open for your final review." if review_only else "The configured editor action was verified."
+            receipt_items = [("Checks", f"{current} of {total}"), ("Preview", "Verified" if output_ready else "Check preview"), ("Elapsed", elapsed)]
+
+    component_id = f"{run_id}-{surface}"
+    previous_values = st.session_state.setdefault("progress_previous", {})
+    previous_current = previous_values.get(component_id, current)
+    previous_values[component_id] = current
+    announcement_state = st.session_state.setdefault("progress_announcements", {})
+    announcement_signature = f"{state}:{record_stage}:{current}:{total}"
+    announcement = ""
+    if announcement_state.get(component_id) != announcement_signature:
+        announcement = f"{workspace_label}: {stage_label}."
+        announcement_state[component_id] = announcement_signature
+
+    model = RunProgressModel(
+        component_id=component_id,
+        workspace=workspace,
+        title=f"{workspace_label} run",
+        state=state,
+        health=health,
+        current=current,
+        total=total or None,
+        previous_current=safe_progress_int(previous_current),
+        stage=stage_label,
+        elapsed=elapsed,
+        eta=eta,
+        last_updated=format_freshness(last_update_age),
+        status_label="Ready for review" if workspace == "studio" and state == "completed" and bool(runtime_details.get("review_only")) else "",
+        subprogress_label=subprogress_label,
+        subprogress_current=subprogress_current,
+        subprogress_total=subprogress_total,
+        stages=(),
+        activities=extract_activity_items(log_text, workspace, limit=3),
+        history=history,
+        detail_items=tuple(detail_items),
+        notice=notice,
+        receipt_title=receipt_title,
+        receipt_body=receipt_body,
+        receipt_items=tuple(receipt_items),
+        aria_label=f"{workspace_label} run progress",
+        announcement=announcement,
+        motion_phase=time.time() % 3.2,
+    )
+    runtime_details.update(
+        {
+            "workspace": workspace,
+            "workspace_label": workspace_label,
+            "run_id": run_id,
+            "record": record,
+            "runtime": runtime,
+            "running": process_running,
+            "state": state,
+            "log_path": log_path,
+            "log_text": log_text,
+            "output_path": output_path,
+            "output_ready": output_ready,
+        }
+    )
+    return model, runtime_details
+
+
 def emit_runtime_notifications() -> None:
     notification_state = st.session_state.setdefault("runtime_notifications", {})
     for bot_type, runtime in st.session_state.bot_runtimes.items():
@@ -3733,76 +5042,369 @@ def emit_runtime_notifications() -> None:
         label = {"comment": "Engage", "download": "Capture", "word_art": "Studio"}.get(bot_type, bot_type)
         if return_code == 0:
             st.toast(f"{label} run finished.")
+            send_mac_notification(f"{label} run complete", "Panelyra is ready for review.")
         else:
             st.toast(f"{label} run stopped with code {return_code}. Open its Live view for details.")
+            send_mac_notification(f"{label} run needs attention", "Open Panelyra to review the run details.")
 
 
-def auto_advance_completed_workspace(page: str) -> None:
-    workspace_runtime = {"Engage": "comment", "Capture": "download", "Studio": "word_art"}
-    bot_type = workspace_runtime.get(page)
-    if not bot_type or st.session_state.get(f"{page.lower()}_view") != "Live":
+def send_mac_notification(title: str, message: str) -> None:
+    """Send an opt-in local Notification Center alert on macOS."""
+    if not bool(st.session_state.get("mac_notifications", False)):
         return
-    runtime = st.session_state.bot_runtimes[bot_type]
-    process = runtime.get("process")
-    if process is None or process.poll() is None:
+    if sys.platform != "darwin":
         return
-    signature = f"{getattr(process, 'pid', 0)}:{process.returncode}"
-    marker_key = f"{page.lower()}_auto_advanced"
-    if st.session_state.get(marker_key) == signature:
+    safe_title = str(title).replace("\\", "\\\\").replace('"', '\\"')[:120]
+    safe_message = str(message).replace("\\", "\\\\").replace('"', '\\"')[:240]
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{safe_message}" with title "{safe_title}"',
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def is_streamlit_test_session() -> bool:
+    context = get_script_run_ctx(suppress_warning=True)
+    return bool(context and context.session_id == "test session id")
+
+
+def render_progress_component(model: RunProgressModel, *, compact: bool = False) -> None:
+    st.html(
+        build_progress_html(
+            model,
+            motion_mode=str(st.session_state.progress_animation),
+            compact=compact,
+            show_history=bool(st.session_state.progress_history) and not compact,
+        )
+    )
+
+
+def reveal_in_finder(path_value: object) -> None:
+    if sys.platform != "darwin":
+        st.warning("This action is available in the Mac app.")
         return
-    st.session_state[marker_key] = signature
-    st.session_state[f"{page.lower()}_view"] = "Results"
+    path = Path(str(path_value)).expanduser() if path_value else None
+    if path is None or not path.exists():
+        st.warning("Panelyra could not verify that output yet.")
+        return
+    command = ["open", "-R", str(path)] if path.is_file() else ["open", str(path)]
+    try:
+        subprocess.run(command, check=False)
+    except OSError:
+        st.warning("Finder could not open that output.")
+
+
+def focus_assistant_on_run(model: RunProgressModel, details: dict[str, object]) -> None:
+    st.session_state.assistant_run_context = {
+        "workspace": str(details["workspace"]),
+        "bot_type": str(details.get("record", {}).get("bot_type", ""))
+        if isinstance(details.get("record"), dict)
+        else "",
+        "run_id": str(details["run_id"]),
+        "state": model.state,
+        "stage": model.stage,
+    }
+    st.session_state.assistant_prompt = (
+        f"Help me understand this {details['workspace_label']} run: "
+        f"{model.state} at {model.stage}."
+    )
+    set_page("Assistant")
     request_scroll_to_top()
     st.rerun()
 
 
-def render_run_dock() -> None:
-    active = [
-        (bot_type, runtime)
-        for bot_type, runtime in st.session_state.bot_runtimes.items()
-        if is_process_running(runtime.get("process"))
-    ]
-    if not active:
+def open_workspace_results(workspace_label: str) -> None:
+    if workspace_label == "Capture":
+        set_page("Library")
+    else:
+        set_page(workspace_label)
+        st.session_state[f"{workspace_label.lower()}_view"] = "Results"
+    request_scroll_to_top()
+    st.rerun()
+
+
+def prepare_workspace_retry(workspace_label: str) -> None:
+    step_keys = {"Engage": "engage_setup_step", "Capture": "capture_setup_step", "Studio": "studio_setup_step"}
+    if workspace_label in step_keys:
+        st.session_state[step_keys[workspace_label]] = 3
+    set_page(workspace_label)
+    st.session_state[f"{workspace_label.lower()}_view"] = "Configure"
+    request_scroll_to_top()
+    st.rerun()
+
+
+def continue_waiting_run(bot_type: str, details: dict[str, object]) -> None:
+    runtime = details["runtime"]
+    if not isinstance(runtime, dict):
+        return
+    signal_path = runtime.get("signal_path")
+    if signal_path is None:
+        st.warning("The browser is still waiting, but this dashboard session cannot recover its Continue signal. Stop and prepare the run again.")
+        return
+    Path(signal_path).write_text("start\n", encoding="utf-8")
+    runtime["signal_path"] = None
+    if bot_type == "download":
+        st.session_state.start_signal_path = None
+        st.session_state.lyra_capture_prepared = False
+        st.session_state.lyra_capture_review_status = "capture started"
+    st.toast(f"{details['workspace_label']} is continuing from the active browser page.")
+    st.rerun()
+
+
+def inspect_prepared_capture_browser() -> dict[str, object]:
+    snapshot = inspect_chrome_page(
+        include_screenshot=False,
+        screenshot_dir=APP_DIR / "outputs" / "assistant",
+        debug_port=9223,
+    )
+    expected_url = str(st.session_state.lyra_capture_expected_url or st.session_state.ocr_start_url)
+    actual_url = str(snapshot.get("url", ""))
+    warnings: list[str] = []
+    if snapshot.get("available"):
+        expected_host = (urlparse(expected_url).hostname or "").lower()
+        actual_host = (urlparse(actual_url).hostname or "").lower()
+        if expected_host and actual_host and expected_host != actual_host:
+            warnings.append(f"Chrome is on {actual_host}, not {expected_host}.")
+        page_text = str(snapshot.get("text_excerpt", "")).lower()
+        if any(term in page_text for term in ("log in", "sign in", "login", "verify you are human")):
+            warnings.append("The reader may require login or a browser verification step.")
+        if not snapshot.get("links") and not snapshot.get("buttons"):
+            warnings.append("Lyra could not identify reader controls yet; allow the page to finish loading and recheck.")
+        ready = not (expected_host and actual_host and expected_host != actual_host)
+    else:
+        ready = False
+        warnings.append(str(snapshot.get("error", "The Capture browser is not inspectable yet.")))
+    snapshot["warnings"] = warnings
+    snapshot["ready_to_begin"] = ready
+    st.session_state.lyra_capture_browser_snapshot = snapshot
+    st.session_state.lyra_capture_review_status = (
+        "ready to begin" if ready else "browser needs attention"
+    )
+    return snapshot
+
+
+def cancel_prepared_capture() -> None:
+    runtime = st.session_state.bot_runtimes.get("download", {})
+    signal_path = runtime.get("signal_path")
+    stop_bot(runtime.get("process"))
+    if signal_path:
+        Path(signal_path).unlink(missing_ok=True)
+    runtime["signal_path"] = None
+    runtime["paused"] = False
+    st.session_state.start_signal_path = None
+    st.session_state.lyra_capture_prepared = False
+    st.session_state.lyra_capture_review_status = "cancelled"
+    st.session_state.capture_setup_step = 3
+    set_page("Capture Setup")
+
+
+def render_live_run_actions(
+    bot_type: str,
+    model: RunProgressModel,
+    details: dict[str, object],
+) -> None:
+    runtime = details["runtime"]
+    assert isinstance(runtime, dict)
+    running_for_workspace = bool(details["running"])
+    workspace_label = str(details["workspace_label"])
+    output_path = details.get("output_path")
+    output_ready = bool(details.get("output_ready"))
+
+    if model.state == "completed":
+        columns = st.columns(3)
+        if columns[0].button("View results", key=f"progress_results_{bot_type}", type="primary", width="stretch"):
+            open_workspace_results(workspace_label)
+        if columns[1].button(
+            "Show in Finder",
+            key=f"progress_output_{bot_type}",
+            disabled=not output_ready,
+            width="stretch",
+        ):
+            reveal_in_finder(output_path)
+        if columns[2].button("Run again", key=f"progress_again_{bot_type}", width="stretch"):
+            prepare_workspace_retry(workspace_label)
         return
 
-    labels = {"comment": "Engage", "download": "Capture", "word_art": "Studio"}
-    pages = {"comment": "Engage", "download": "Capture", "word_art": "Studio"}
-    st.markdown('<div class="run-dock-label">Active runs</div>', unsafe_allow_html=True)
+    if model.state in {"failed", "stopped"}:
+        columns = st.columns(2)
+        if columns[0].button(
+            "Review and retry",
+            key=f"progress_retry_{bot_type}",
+            type="primary",
+            width="stretch",
+        ):
+            prepare_workspace_retry(workspace_label)
+        if columns[1].button(
+            "Show output in Finder",
+            key=f"progress_partial_output_{bot_type}",
+            disabled=not output_ready,
+            width="stretch",
+        ):
+            reveal_in_finder(output_path)
+        return
+
+    columns = st.columns(3)
+    if model.state == "waiting":
+        capture_review_ready = bool(
+            st.session_state.lyra_capture_browser_snapshot.get("ready_to_begin")
+        ) if bot_type == "download" and st.session_state.lyra_capture_prepared else True
+        signal_ready = runtime.get("signal_path") is not None and capture_review_ready
+        if columns[0].button(
+            "Begin Capture" if bot_type == "download" and st.session_state.lyra_capture_prepared else (
+                "Continue in browser" if signal_ready else "Waiting for browser"
+            ),
+            key=f"progress_continue_{bot_type}",
+            type="primary",
+            disabled=not running_for_workspace or not signal_ready,
+            width="stretch",
+        ):
+            continue_waiting_run(bot_type, details)
+    else:
+        pause_label = "Resume" if runtime.get("paused") else "Pause"
+        if columns[0].button(
+            pause_label,
+            key=f"progress_pause_{bot_type}",
+            disabled=not running_for_workspace,
+            width="stretch",
+        ):
+            changed = (
+                resume_bot(runtime.get("process"))
+                if runtime.get("paused")
+                else pause_bot(runtime.get("process"))
+            )
+            if changed:
+                runtime["paused"] = not runtime.get("paused", False)
+                st.rerun()
+    if model.state == "waiting":
+        pause_label = "Resume" if runtime.get("paused") else "Pause"
+        if columns[1].button(
+            pause_label,
+            key=f"progress_wait_pause_{bot_type}",
+            disabled=not running_for_workspace,
+            width="stretch",
+        ):
+            changed = (
+                resume_bot(runtime.get("process"))
+                if runtime.get("paused")
+                else pause_bot(runtime.get("process"))
+            )
+            if changed:
+                runtime["paused"] = not runtime.get("paused", False)
+                st.rerun()
+    else:
+        if columns[1].button(
+            "Show output",
+            key=f"progress_live_output_{bot_type}",
+            disabled=not output_ready,
+            width="stretch",
+        ):
+            reveal_in_finder(output_path)
+    if columns[2].button(
+        "Stop",
+        key=f"progress_stop_{bot_type}",
+        disabled=not running_for_workspace,
+        width="stretch",
+    ):
+        stop_bot(runtime.get("process"))
+        runtime["paused"] = False
+        st.rerun()
+
+
+def _render_live_progress_region(bot_type: str) -> None:
+    emit_runtime_notifications()
+    model, details = build_run_progress_model(bot_type, surface="live")
+    fragment_activity = st.session_state.setdefault("progress_fragment_activity", {})
+    was_active = bool(fragment_activity.get(bot_type))
+    is_active = bool(details["running"])
+    fragment_activity[bot_type] = is_active
+    if was_active and not is_active:
+        st.rerun()
+    render_progress_component(model)
+    render_live_run_actions(bot_type, model, details)
+
+
+def render_live_progress_region(bot_type: str) -> None:
+    fragment_api = getattr(st, "fragment", None)
+    if callable(fragment_api):
+        runtime = st.session_state.bot_runtimes.get(bot_type, {})
+        is_active = is_process_running(runtime.get("process"))
+        run_every = (
+            f"{int(st.session_state.auto_refresh_seconds)}s"
+            if is_active and not is_streamlit_test_session()
+            else None
+        )
+        fragment_api(run_every=run_every)(_render_live_progress_region)(bot_type)
+        return
+    _render_live_progress_region(bot_type)
+
+
+def _render_run_dock_region() -> None:
+    active = [
+        bot_type
+        for bot_type, runtime in st.session_state.bot_runtimes.items()
+        if bot_type in PROGRESS_WORKSPACES and is_process_running(runtime.get("process"))
+    ]
+    dock_was_active = bool(st.session_state.get("progress_dock_active"))
+    st.session_state.progress_dock_active = bool(active)
+    if dock_was_active and not active:
+        emit_runtime_notifications()
+        st.rerun()
+    if not active:
+        return
+    st.markdown('<div class="run-dock-label">Active Mac runs</div>', unsafe_allow_html=True)
     with st.container(border=True):
-        for bot_type, runtime in active:
-            record = load_runtime_record(bot_type)
-            started_at = int(record.get("started_at", int(time.time())) or int(time.time()))
-            current = int(record.get("progress_current", 0) or 0)
-            total = int(record.get("progress_total", 0) or 0)
-            stage = str(record.get("message") or record.get("stage") or "Running")
-            summary, pause_col, stop_col, open_col = st.columns([3.8, 0.75, 0.75, 0.9])
-            with summary:
-                st.markdown(f"**{labels[bot_type]}** · {stage}")
-                detail = f"Elapsed {format_elapsed(int(time.time()) - started_at)} · ETA {estimate_remaining(record)}"
-                if total:
-                    detail += f" · {current}/{total}"
-                    st.progress(min(1.0, current / max(1, total)))
-                st.caption(detail)
+        for bot_type in active:
+            model, details = build_run_progress_model(bot_type, surface="dock")
+            render_progress_component(model, compact=True)
+            runtime = details["runtime"]
+            assert isinstance(runtime, dict)
+            pause_column, stop_column, open_column = st.columns(3)
             pause_label = "Resume" if runtime.get("paused") else "Pause"
-            if pause_col.button(
-                pause_label,
-                key=f"dock_pause_{bot_type}",
-                disabled=not is_process_running(runtime.get("process")),
-                width="stretch",
-            ):
-                changed = resume_bot(runtime.get("process")) if runtime.get("paused") else pause_bot(runtime.get("process"))
+            if pause_column.button(pause_label, key=f"dock_pause_{bot_type}", width="stretch"):
+                changed = (
+                    resume_bot(runtime.get("process"))
+                    if runtime.get("paused")
+                    else pause_bot(runtime.get("process"))
+                )
                 if changed:
                     runtime["paused"] = not runtime.get("paused", False)
                     st.rerun()
-            if stop_col.button("Stop", key=f"dock_stop_{bot_type}", width="stretch"):
+            if stop_column.button("Stop", key=f"dock_stop_{bot_type}", width="stretch"):
                 stop_bot(runtime.get("process"))
                 runtime["paused"] = False
                 st.rerun()
-            if open_col.button("Open", key=f"dock_open_{bot_type}", width="stretch"):
-                set_page(pages[bot_type])
-                st.session_state[f"{pages[bot_type].lower()}_view"] = "Live"
+            if open_column.button("Open Live", key=f"dock_open_{bot_type}", width="stretch"):
+                workspace_label = str(details["workspace_label"])
+                set_page(workspace_label)
+                st.session_state[f"{workspace_label.lower()}_view"] = "Live"
                 request_scroll_to_top()
                 st.rerun()
+
+
+def render_run_dock() -> None:
+    fragment_api = getattr(st, "fragment", None)
+    if callable(fragment_api):
+        has_active_run = any(
+            is_process_running(runtime.get("process"))
+            for runtime in st.session_state.bot_runtimes.values()
+        )
+        run_every = (
+            f"{int(st.session_state.auto_refresh_seconds)}s"
+            if has_active_run and not is_streamlit_test_session()
+            else None
+        )
+        fragment_api(run_every=run_every)(_render_run_dock_region)()
+        return
+    _render_run_dock_region()
 
 
 def persist_workspace_drafts() -> None:
@@ -3812,11 +5414,29 @@ def persist_workspace_drafts() -> None:
         if key in st.session_state
         and isinstance(st.session_state[key], (str, int, float, bool))
     }
-    encoded = json.dumps(drafts, sort_keys=True, ensure_ascii=False)
+    durable_preferences = {
+        "workspace_drafts": drafts,
+        "default_landing_page": str(st.session_state.default_landing_page),
+        "assistant_use_model": bool(st.session_state.assistant_use_model),
+        "progress_animation": str(st.session_state.progress_animation),
+        "progress_history": bool(st.session_state.progress_history),
+        "mac_notifications": bool(st.session_state.mac_notifications),
+        "compact_ui": bool(st.session_state.compact_ui),
+        "compact_sidebar": bool(st.session_state.compact_sidebar),
+        "assistant_local_model": str(st.session_state.assistant_local_model),
+        "assistant_history_limit": int(st.session_state.assistant_history_limit),
+        "assistant_save_history": bool(st.session_state.assistant_save_history),
+        "assistant_internet_endpoint": str(st.session_state.assistant_internet_endpoint),
+        "assistant_web_search_enabled": bool(st.session_state.assistant_web_search_enabled),
+        "assistant_use_openai_web": bool(st.session_state.assistant_use_openai_web),
+        "assistant_model": str(st.session_state.assistant_model),
+        "show_lyra_in_immersive_reader": bool(st.session_state.show_lyra_in_immersive_reader),
+    }
+    encoded = json.dumps(durable_preferences, sort_keys=True, ensure_ascii=False)
     if st.session_state.get("_saved_workspace_drafts") == encoded:
         return
     preferences = load_preferences()
-    preferences["workspace_drafts"] = drafts
+    preferences.update(durable_preferences)
     save_preferences(preferences)
     st.session_state["_saved_workspace_drafts"] = encoded
 
@@ -3837,9 +5457,7 @@ def restore_run_configuration(record: dict[str, object]) -> None:
         st.session_state.ocr_reader_layout = str(settings.get("reader_layout", "auto"))
         set_page("Capture Setup")
     else:
-        st.session_state.note_url = str(settings.get("note_url", ""))
-        st.session_state.word_art_style_mode = str(settings.get("style", "banner"))
-        set_page("Studio Setup")
+        set_page("Studio")
 
 
 page_bot_type = runtime_type_for_page(st.session_state.page)
@@ -3848,16 +5466,6 @@ status_label = runtime_status(page_bot_type) if page_bot_type else (
 )
 
 with st.sidebar:
-    st.markdown(
-        """
-        <div class="mac-traffic">
-          <span class="traffic-dot traffic-red">x</span>
-          <span class="traffic-dot traffic-yellow">-</span>
-          <span class="traffic-dot traffic-green">+</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
     st.markdown(
         f"""
         <div class="brand-lockup">
@@ -3877,10 +5485,31 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.divider()
+    navigation_help = {
+        "Dashboard": "Start here and choose what you want Panelyra to do.",
+        "Engage": "Create and verify contextual chapter comments.",
+        "Capture": "Save chapter images, CBZ archives, and optional OCR.",
+        "Downloads": "Search for a series and download selected chapters.",
+
+        "Library": "Read saved series and continue where you stopped.",
+        "Activity": "Review completed, stopped, and failed runs.",
+
+        "Help": "Learn how the app and each workflow work.",
+        "Settings": "Control appearance, storage, and local integrations.",
+    }
     for group, pages in NAVIGATION_GROUPS.items():
         st.caption(group)
         for navigation_page in pages:
-            if st.button(navigation_page, key=f"nav_{navigation_page}", width="stretch"):
+            runtime_type = runtime_type_for_page(navigation_page)
+            is_active_run = runtime_type in running_bots
+            label = f"{navigation_page}  •" if is_active_run else navigation_page
+            if st.button(
+                label,
+                key=f"nav_{navigation_page}",
+                type="primary" if str(st.session_state.page) == navigation_page else "secondary",
+
+                width="stretch",
+            ):
                 set_page(navigation_page)
                 st.rerun()
     if st.session_state.show_sidebar_paths:
@@ -3901,1936 +5530,64 @@ elif page.startswith("Capture"):
 elif page.startswith("Studio"):
     running = is_process_running(st.session_state.bot_runtimes["word_art"].get("process"))
 
-render_global_bar(page, status_label)
+if st.session_state.get("route_notice"):
+    st.info(st.session_state.pop("route_notice"))
 emit_runtime_notifications()
-auto_advance_completed_workspace(page)
 route_page = render_workspace_view(page)
 
-if route_page == "Overview":
-    render_page_header(
-        "What do you want to run?",
-        "Choose a workspace, configure the target, and follow the run from one screen.",
-        [PRODUCT_MODE, f"Version {PRODUCT_VERSION}", "Local automation"],
-    )
+if route_page == "Library":
+    from panelyra.screens.library import render as render_library
+    render_library(APP_DIR=APP_DIR, PANELYRA_LOG_DIR=PANELYRA_LOG_DIR, Path=Path, READER_PROGRESS_FILE=READER_PROGRESS_FILE, ReaderProgressStore=ReaderProgressStore, _chapter_integrity=_chapter_integrity, _chapter_number=_chapter_number, _reader_cover_data=_reader_cover_data, html=html, is_process_running=is_process_running, json=json, local_reader_service=local_reader_service, reader_catalog=reader_catalog, render_cleaner_review=render_cleaner_review, render_page_header=render_page_header, set_page=set_page, st=st, start_clean_review=start_clean_review, subprocess=subprocess, sys=sys)
 
-    if not st.session_state.onboarding_complete:
-        st.markdown("### First-run setup")
-        with st.container(border=True):
-            st.markdown(
-                "Panelyra runs locally and controls a visible browser. Use it only with sites and content you own, administer, or have explicit permission to test."
-            )
-            onboarding_authorized = st.checkbox(
-                "I will use Panelyra only on authorized targets.",
-                key="onboarding_authorized",
-            )
-            if st.button(
-                "Complete local setup",
-                type="primary",
-                disabled=not onboarding_authorized,
-                width="stretch",
-            ):
-                st.session_state.onboarding_complete = True
-                st.session_state.authorization_confirmed = True
-                save_preferences(
-                    {
-                        "onboarding_complete": True,
-                        "authorization_confirmed": True,
-                        "retention_days": int(st.session_state.retention_days),
-                    }
-                )
-                st.rerun()
+elif route_page == 'Engage Setup':
+    from panelyra.screens.engage import render as render_engage
+    render_engage(CONTENT_MODE_OPTIONS=CONTENT_MODE_OPTIONS, SCROLL_PRESETS=SCROLL_PRESETS, apply_reader_defaults=apply_reader_defaults, apply_selected_reader_mode_defaults=apply_selected_reader_mode_defaults, generate_comment_preview=generate_comment_preview, load_presets=load_presets, load_selector_profiles=load_selector_profiles, normalized_speed_name=normalized_speed_name, preflight_url=preflight_url, reader_defaults_for_mode=reader_defaults_for_mode, render_page_header=render_page_header, running=running, set_page=set_page, st=st, start_bot=start_bot)
 
-    run_records = list_run_records(limit=100)
-    capture_pages = cached_capture_page_count(str(OCR_DOWNLOAD_DIR))
-    recent_failures = sum(
-        1
-        for record in run_records[:20]
-        if str(record.get("status", "")).lower() in {"failed", "error"}
-        or bool(str(record.get("stop_reason", "")).strip())
-    )
-    top_metrics = st.columns(4)
-    with top_metrics[0]:
-        render_metric_card("Active runs", len(running_bots), "Across all workspaces", idle=not running_bots)
-    with top_metrics[1]:
-        render_metric_card("Submitted comments", len(submitted_records(history_records)), "Verified local records")
-    with top_metrics[2]:
-        render_metric_card("Captured pages", capture_pages, "Saved image files")
-    with top_metrics[3]:
-        render_metric_card("Recent failures", recent_failures, "Across the latest 20 runs")
+elif route_page == 'Downloads':
+    render_page_header("Downloads", "Find a series. Choose chapters. Save to your library.")
+    from panelyra.services.manga_backend_ui import render_manga_backend
+    render_manga_backend()
 
-    st.markdown("### Start a workspace")
-    st.divider()
-    workflow_cards = st.columns(3)
-    with workflow_cards[0]:
-        render_panel("Panelyra Engage", "Generate, submit, verify, and review contextual chapter comments.")
-        if st.button("Start Comment Testing", key="dashboard_engage", type="primary", width="stretch"):
-            set_page("Engage Setup")
-            st.rerun()
-    with workflow_cards[1]:
-        render_panel("Panelyra Capture", "Collect chapter pages, build CBZ archives, and create OCR transcripts.")
-        if st.button("Start Chapter Capture", key="dashboard_capture", width="stretch"):
-            set_page("Capture Setup")
-            st.rerun()
-    with workflow_cards[2]:
-        render_panel("Panelyra Studio", "Compose Word Art, preview the result, and send it to a configured editor.")
-        if st.button("Start Creative Studio", key="dashboard_studio", width="stretch"):
-            set_page("Studio Setup")
-            st.rerun()
+elif route_page == 'Capture Setup':
+    from panelyra.screens.capture import render as render_capture
+    render_capture(MANHWA_CONTAINER_SELECTOR=MANHWA_CONTAINER_SELECTOR, MANHWA_IMAGE_SELECTOR=MANHWA_IMAGE_SELECTOR, OCR_DOWNLOAD_DIR=OCR_DOWNLOAD_DIR, Path=Path, apply_ocr_download_defaults=apply_ocr_download_defaults, display_path=display_path, load_selector_profiles=load_selector_profiles, preflight_url=preflight_url, render_page_header=render_page_header, running=running, set_page=set_page, st=st, start_manhwa_ocr_bot=start_manhwa_ocr_bot)
 
-    if run_records:
-        recent = run_records[0]
-        continue_cols = st.columns([3, 1])
-        continue_cols[0].info(
-            f"Latest run: {str(recent.get('bot_type', 'automation')).replace('_', ' ').title()} · "
-            f"{recent.get('status', 'unknown')} · {recent.get('stage', 'unknown')}"
-        )
-        if continue_cols[1].button("Continue configuration", width="stretch"):
-            restore_run_configuration(recent)
-            st.rerun()
-    else:
-        st.info("No runs yet. Choose a workspace above to create the first one.")
+elif route_page == 'Activity':
+    from panelyra.screens.activity import render as render_activity
+    render_activity(display_path=display_path, json=json, list_run_records=list_run_records, redact_private_paths=redact_private_paths, render_page_header=render_page_header, restore_run_configuration=restore_run_configuration, set_page=set_page, st=st, time=time, uuid=uuid)
 
-    with st.expander("System readiness", expanded=False):
-        health_rows = environment_health()
-        st.dataframe(health_rows, width="stretch", hide_index=True)
 
-elif route_page == "Engage Setup":
-    comment_runtime = st.session_state.bot_runtimes["comment"]
-    apply_reader_defaults(str(st.session_state.get("content_mode", "Auto")))
-    selector_profiles = load_selector_profiles()
-    if st.session_state.selected_selector_profile not in selector_profiles:
-        st.session_state.selected_selector_profile = next(iter(selector_profiles))
-    active_selector_values = selector_profiles[st.session_state.selected_selector_profile]
-    for field_name, profile_key in (
-        ("engage_next_link_selector", "next_link"),
-        ("engage_next_page_selector", "next_page"),
-        ("engage_page_counter_selector", "page_counter"),
-        ("engage_chapter_list_selector", "chapter_list"),
-        ("engage_comment_editor_selector", "comment_editor"),
-        ("engage_submit_button_selector", "submit"),
-        ("engage_thanks_button_selector", "thanks"),
-        ("engage_confirmation_selector", "confirmation"),
-    ):
-        if field_name not in st.session_state:
-            st.session_state[field_name] = active_selector_values.get(profile_key, "")
-    setup_step = max(1, min(3, int(st.session_state.get("engage_setup_step", 1))))
-    st.session_state.engage_setup_step = setup_step
-    step_titles = {1: "Target", 2: "Behavior", 3: "Review and start"}
-    render_page_header(
-        "Engage",
-        step_titles[setup_step],
-        [f"Step {setup_step} of 3"],
-    )
+elif route_page == 'Settings':
+    from panelyra.screens.settings import render as render_settings
+    render_settings(APP_DIR=APP_DIR, DEFAULT_SETTINGS=DEFAULT_SETTINGS, PAGES=PAGES, environment_health=environment_health, load_presets=load_presets, load_selector_profiles=load_selector_profiles, render_page_header=render_page_header, save_local_preferences=save_local_preferences, save_presets=save_presets, save_selector_profiles=save_selector_profiles, st=st)
 
-    if setup_step == 1:
-        st.markdown("### Choose the target")
-        with st.expander("Use a saved configuration", expanded=False):
-            presets = load_presets()
-            preset_columns = st.columns([3, 1])
-            selected_preset = preset_columns[0].selectbox(
-                "Saved configuration",
-                options=list(presets),
-                key="selected_workflow_preset",
-                label_visibility="collapsed",
-            )
-            if preset_columns[1].button("Apply", key="engage_apply_preset", width="stretch"):
-                selected_values = presets[selected_preset]
-                for key in ("scroll_preset", "chapter_routing", "max_chapters", "use_thanks_marker"):
-                    if key in selected_values:
-                        st.session_state[key] = (
-                            normalized_speed_name(selected_values[key])
-                            if key == "scroll_preset"
-                            else selected_values[key]
-                        )
-                st.toast(f"Applied {selected_preset}.")
-                st.rerun()
-        target_columns = st.columns([3, 1])
-        target_columns[0].text_input(
-            "Starting URL",
-            key="start_url",
-            placeholder="https://staging.example.com/chapter-1",
-        )
-        target_columns[1].number_input(
-            "Maximum chapters",
-            key="max_chapters",
-            min_value=1,
-            max_value=10_000,
-            step=1,
-        )
-        st.selectbox(
-            "Reader layout",
-            options=["auto", "next-link", "infinite-scroll", "paginated", "mixed"],
-            key="chapter_routing",
-            format_func=lambda value: {
-                "auto": "Auto detect",
-                "next-link": "Next chapter control",
-                "infinite-scroll": "Continuous chapters",
-                "paginated": "Next page reader",
-                "mixed": "Pages plus next chapter",
-            }[value],
-        )
-        target_errors = preflight_url(str(st.session_state.start_url))
-        if target_errors:
-            st.caption(target_errors[0])
-        if st.button(
-            "Continue to behavior",
-            type="primary",
-            disabled=bool(target_errors),
-            width="stretch",
-        ):
-            st.session_state.engage_setup_step = 2
-            st.rerun()
+elif route_page == 'Storage':
+    from panelyra.screens.storage import render as render_storage
+    render_storage(format_bytes=format_bytes, prune_generated_files=prune_generated_files, render_page_header=render_page_header, save_local_preferences=save_local_preferences, st=st, storage_report=storage_report)
 
-    elif setup_step == 2:
-        st.markdown("### Choose how the run behaves")
-        behavior_columns = st.columns(2)
-        with behavior_columns[0]:
-            st.selectbox(
-                "Performance mode",
-                options=list(SCROLL_PRESETS),
-                key="scroll_preset",
-            )
-            st.caption(SCROLL_PRESETS[normalized_speed_name(st.session_state.scroll_preset)]["description"])
-            st.checkbox(
-                "Thank and mark completed chapters",
-                key="use_thanks_marker",
-            )
-        with behavior_columns[1]:
-            st.radio(
-                "Content reader",
-                options=list(CONTENT_MODE_OPTIONS),
-                key="content_mode",
-                on_change=apply_selected_reader_mode_defaults,
-            )
-            st.caption("Auto is recommended for most targets.")
+elif route_page == 'Engage Live':
+    from panelyra.screens.engage_live import render as render_engage_live
+    render_engage_live(Path=Path, parse_bot_progress=parse_bot_progress, read_log=read_log, render_live_progress_region=render_live_progress_region, render_page_header=render_page_header, render_setup_stepper=render_setup_stepper, st=st)
 
-        with st.expander("Review the first comment", expanded=False):
-            st.checkbox(
-                "Use reviewed text for chapter one",
-                key="review_first_comment",
-            )
-            st.text_input(
-                "Preview focus",
-                key="comment_preview_subject",
-                placeholder="A character, clue, conflict, or turning point",
-            )
-            if st.button("Regenerate preview", key="regenerate_comment_preview"):
-                st.session_state.comment_preview_text = generate_comment_preview(
-                    str(st.session_state.comment_preview_subject)
-                )
-            st.text_area(
-                "First comment",
-                key="comment_preview_text",
-                height=110,
-                disabled=not st.session_state.review_first_comment,
-            )
+elif route_page == 'Capture Live':
+    from panelyra.screens.capture_live import render as render_capture_live
+    render_capture_live(Path=Path, cancel_prepared_capture=cancel_prepared_capture, inspect_prepared_capture_browser=inspect_prepared_capture_browser, parse_ocr_progress=parse_ocr_progress, read_log=read_log, render_live_progress_region=render_live_progress_region, render_page_header=render_page_header, render_setup_stepper=render_setup_stepper, st=st)
 
-        with st.expander("Optional context", expanded=False):
-            st.text_input("Local context file", key="research_file")
-            st.text_input(
-                "Context endpoint",
-                key="research_endpoint",
-                placeholder="http://127.0.0.1:8000/research",
-            )
+elif route_page == 'Engage Insights':
+    from panelyra.screens.engage_insights import render as render_engage_insights
+    render_engage_insights(COMMENT_STYLES=COMMENT_STYLES, Counter=Counter, HISTORY_FILE=HISTORY_FILE, history_records=history_records, render_jsonl_metric_grid=render_jsonl_metric_grid, render_page_header=render_page_header, render_panel=render_panel, st=st, style_recommendation=style_recommendation)
 
-        with st.expander("Advanced configuration", expanded=False):
-            profile_columns = st.columns([3, 1])
-            profile_columns[0].selectbox(
-                "Selector profile",
-                options=list(selector_profiles),
-                key="selected_selector_profile",
-            )
-            if profile_columns[1].button("Apply profile", width="stretch"):
-                values = selector_profiles[st.session_state.selected_selector_profile]
-                for field_name, profile_key in (
-                    ("engage_next_link_selector", "next_link"),
-                    ("engage_next_page_selector", "next_page"),
-                    ("engage_page_counter_selector", "page_counter"),
-                    ("engage_chapter_list_selector", "chapter_list"),
-                    ("engage_comment_editor_selector", "comment_editor"),
-                    ("engage_submit_button_selector", "submit"),
-                    ("engage_thanks_button_selector", "thanks"),
-                    ("engage_confirmation_selector", "confirmation"),
-                ):
-                    st.session_state[field_name] = values.get(profile_key, "")
-                st.rerun()
-
-            selector_columns = st.columns(2)
-            selector_columns[0].text_input("Next chapter", key="engage_next_link_selector")
-            selector_columns[1].text_input("Next page", key="engage_next_page_selector")
-            selector_columns[0].text_input("Page counter", key="engage_page_counter_selector")
-            selector_columns[1].text_input("Chapter list", key="engage_chapter_list_selector")
-            selector_columns[0].text_input("Comment editor", key="engage_comment_editor_selector")
-            selector_columns[1].text_input("Submit control", key="engage_submit_button_selector")
-            selector_columns[0].text_input("Thanks control", key="engage_thanks_button_selector")
-            selector_columns[1].text_input("Confirmation", key="engage_confirmation_selector")
-
-            st.text_input("Content container", key="content_container_selector")
-            st.text_input("Chapter image selector", key="ocr_image_selector")
-            st.slider(
-                "OCR confidence",
-                min_value=0.10,
-                max_value=0.95,
-                step=0.01,
-                key="ocr_confidence",
-            )
-            if normalized_speed_name(st.session_state.scroll_preset) == "Custom":
-                performance_columns = st.columns(2)
-                performance_columns[0].number_input(
-                    "Minimum scroll pixels", min_value=1, max_value=50_000, key="custom_scroll_min_px"
-                )
-                performance_columns[1].number_input(
-                    "Maximum scroll pixels", min_value=1, max_value=50_000, key="custom_scroll_max_px"
-                )
-                performance_columns[0].number_input(
-                    "Minimum scroll pause", min_value=0.0, max_value=10.0, key="custom_scroll_min_delay"
-                )
-                performance_columns[1].number_input(
-                    "Maximum scroll pause", min_value=0.0, max_value=10.0, key="custom_scroll_max_delay"
-                )
-                performance_columns[0].number_input(
-                    "Minimum typing delay", min_value=0.0, max_value=2.0, key="custom_type_min_delay"
-                )
-                performance_columns[1].number_input(
-                    "Maximum typing delay", min_value=0.0, max_value=2.0, key="custom_type_max_delay"
-                )
-                performance_columns[0].number_input(
-                    "Minimum cooldown", min_value=0.0, max_value=60.0, key="custom_cooldown_min"
-                )
-                performance_columns[1].number_input(
-                    "Maximum cooldown", min_value=0.0, max_value=60.0, key="custom_cooldown_max"
-                )
-                st.number_input(
-                    "Submission verification wait",
-                    min_value=0.5,
-                    max_value=30.0,
-                    key="custom_submit_wait",
-                )
-
-        navigation = st.columns(2)
-        if navigation[0].button("Back", width="stretch"):
-            st.session_state.engage_setup_step = 1
-            st.rerun()
-        if navigation[1].button("Continue to review", type="primary", width="stretch"):
-            st.session_state.engage_setup_step = 3
-            st.rerun()
-
-    speed_name = normalized_speed_name(st.session_state.scroll_preset)
-    speed = SCROLL_PRESETS[speed_name]
-    if speed_name == "Custom":
-        scroll_min_px = int(st.session_state.custom_scroll_min_px)
-        scroll_max_px = int(st.session_state.custom_scroll_max_px)
-        scroll_min_delay = float(st.session_state.custom_scroll_min_delay)
-        scroll_max_delay = float(st.session_state.custom_scroll_max_delay)
-        type_min_delay = float(st.session_state.custom_type_min_delay)
-        type_max_delay = float(st.session_state.custom_type_max_delay)
-        cooldown_min_seconds = float(st.session_state.custom_cooldown_min)
-        cooldown_max_seconds = float(st.session_state.custom_cooldown_max)
-        post_submit_wait_seconds = float(st.session_state.custom_submit_wait)
-    else:
-        scroll_min_px = int(speed["min_px"])
-        scroll_max_px = int(speed["max_px"])
-        scroll_min_delay = float(speed["min_delay"])
-        scroll_max_delay = float(speed["max_delay"])
-        type_min_delay = float(speed["type_min_delay"])
-        type_max_delay = float(speed["type_max_delay"])
-        cooldown_min_seconds = float(speed["cooldown_min_seconds"])
-        cooldown_max_seconds = float(speed["cooldown_max_seconds"])
-        post_submit_wait_seconds = float(speed["post_submit_wait_seconds"])
-    visible_type_chars = int(speed["visible_type_chars"])
-    reuse_loaded_images = bool(speed["reuse_loaded_images"])
-    content_mode_cli = CONTENT_MODE_OPTIONS[str(st.session_state.content_mode)]
-    default_container_selector, default_image_selector, _ = reader_defaults_for_mode(str(st.session_state.content_mode))
-    effective_content_container_selector = str(st.session_state.content_container_selector).strip() or default_container_selector
-    effective_ocr_image_selector = str(st.session_state.ocr_image_selector).strip() or default_image_selector
-
-    launch_blockers = preflight_url(str(st.session_state.start_url))
-    if not str(st.session_state.engage_comment_editor_selector).strip():
-        launch_blockers.append("add a comment editor selector")
-    if not str(st.session_state.engage_submit_button_selector).strip():
-        launch_blockers.append("add a submit selector")
-    if st.session_state.chapter_routing in {"paginated", "mixed"} and not str(
-        st.session_state.engage_next_page_selector
-    ).strip():
-        launch_blockers.append("add a next-page selector")
-    if scroll_max_px < scroll_min_px or scroll_max_delay < scroll_min_delay:
-        launch_blockers.append("fix the scroll range")
-    if type_max_delay < type_min_delay or cooldown_max_seconds < cooldown_min_seconds:
-        launch_blockers.append("fix the timing range")
-
-    if setup_step == 3:
-        st.markdown("### Review the run")
-        estimated_seconds = int(
-            int(st.session_state.max_chapters)
-            * (12 + (cooldown_min_seconds + cooldown_max_seconds) / 2 + post_submit_wait_seconds)
-        )
-        review_metrics = st.columns(4)
-        review_metrics[0].metric("Target", "Ready" if not preflight_url(str(st.session_state.start_url)) else "Missing")
-        review_metrics[1].metric("Layout", str(st.session_state.chapter_routing).replace("-", " ").title())
-        review_metrics[2].metric("Chapters", int(st.session_state.max_chapters))
-        review_metrics[3].metric("Estimated minimum", f"{max(1, estimated_seconds // 60)} min")
-        st.code(str(st.session_state.start_url), language="text")
-        st.caption(
-            f"{speed_name} mode · {st.session_state.content_mode} reader · "
-            f"{'read markers on' if st.session_state.use_thanks_marker else 'read markers off'}"
-        )
-        if st.session_state.review_first_comment:
-            st.text_area(
-                "Reviewed first comment",
-                value=str(st.session_state.comment_preview_text),
-                disabled=True,
-                height=90,
-            )
-        if launch_blockers:
-            st.warning("Before starting: " + "; ".join(launch_blockers) + ".")
-        else:
-            st.success("Configuration is ready.")
-
-        back_column, prepare_column, direct_column = st.columns([0.8, 1.3, 1.3])
-        if back_column.button("Back", width="stretch"):
-            st.session_state.engage_setup_step = 2
-            st.rerun()
-        prepare_clicked = prepare_column.button(
-            "Open browser and prepare",
-            type="primary",
-            disabled=running or bool(launch_blockers),
-            width="stretch",
-        )
-        direct_clicked = direct_column.button(
-            "Start exact URL",
-            disabled=running or bool(launch_blockers),
-            width="stretch",
-        )
-
-        def launch_engage(wait_for_login: bool) -> None:
-            st.session_state.bot_process, st.session_state.log_path, st.session_state.start_signal_path = start_bot(
-                str(st.session_state.start_url).strip(),
-                int(st.session_state.max_chapters),
-                wait_for_login=wait_for_login,
-                research_file=str(st.session_state.research_file),
-                research_endpoint=str(st.session_state.research_endpoint),
-                use_thanks_marker=bool(st.session_state.use_thanks_marker),
-                chapter_routing=str(st.session_state.chapter_routing),
-                scroll_min_px=scroll_min_px,
-                scroll_max_px=scroll_max_px,
-                scroll_min_delay=scroll_min_delay,
-                scroll_max_delay=scroll_max_delay,
-                reflection_every_n_comments=int(st.session_state.reflection_every_n_comments),
-                content_mode=content_mode_cli,
-                content_container_selector=effective_content_container_selector,
-                ocr_image_selector=effective_ocr_image_selector,
-                ocr_confidence=float(st.session_state.ocr_confidence),
-                type_min_delay=type_min_delay,
-                type_max_delay=type_max_delay,
-                visible_type_chars=visible_type_chars,
-                reuse_loaded_images=reuse_loaded_images,
-                cooldown_min_seconds=cooldown_min_seconds,
-                cooldown_max_seconds=cooldown_max_seconds,
-                post_submit_wait_seconds=post_submit_wait_seconds,
-                next_link_selector=str(st.session_state.engage_next_link_selector).strip(),
-                next_page_selector=str(st.session_state.engage_next_page_selector).strip(),
-                page_counter_selector=str(st.session_state.engage_page_counter_selector).strip(),
-                chapter_list_selector=str(st.session_state.engage_chapter_list_selector).strip(),
-                comment_editor_selector=str(st.session_state.engage_comment_editor_selector).strip(),
-                submit_button_selector=str(st.session_state.engage_submit_button_selector).strip(),
-                thanks_button_selector=str(st.session_state.engage_thanks_button_selector).strip(),
-                confirmation_selector=str(st.session_state.engage_confirmation_selector).strip(),
-                first_comment_override=(
-                    str(st.session_state.comment_preview_text)
-                    if st.session_state.review_first_comment
-                    else ""
-                ),
-            )
-            set_page("Engage Live")
-            st.rerun()
-
-        if prepare_clicked:
-            launch_engage(True)
-        if direct_clicked:
-            launch_engage(False)
-
-elif route_page == "Capture Setup":
-    download_runtime = st.session_state.bot_runtimes["download"]
-    apply_ocr_download_defaults()
-    capture_profiles = load_selector_profiles()
-    if st.session_state.ocr_selector_profile not in capture_profiles:
-        st.session_state.ocr_selector_profile = next(iter(capture_profiles))
-    capture_profile_values = capture_profiles[st.session_state.ocr_selector_profile]
-    for field_name, profile_key in (
-        ("ocr_next_chapter_selector", "next_link"),
-        ("ocr_next_page_selector", "next_page"),
-        ("ocr_page_counter_selector", "page_counter"),
-        ("ocr_chapter_list_selector", "chapter_list"),
-    ):
-        if field_name not in st.session_state:
-            st.session_state[field_name] = capture_profile_values.get(profile_key, "")
-    capture_step = max(1, min(3, int(st.session_state.get("capture_setup_step", 1))))
-    st.session_state.capture_setup_step = capture_step
-    capture_step_titles = {1: "Source", 2: "Output", 3: "Review and start"}
-    render_page_header("Capture", capture_step_titles[capture_step], [f"Step {capture_step} of 3"])
-
-    if capture_step == 1:
-        st.markdown("### Choose the source")
-        source_columns = st.columns([3, 1])
-        source_columns[0].text_input(
-            "Starting URL",
-            key="ocr_start_url",
-            placeholder="https://staging.example.com/chapter-1",
-        )
-        source_columns[1].number_input(
-            "Maximum chapters",
-            min_value=1,
-            max_value=20,
-            step=1,
-            key="ocr_max_chapters",
-        )
-        st.selectbox(
-            "Reader layout",
-            options=["auto", "continuous", "next-chapter", "paginated", "mixed"],
-            key="ocr_reader_layout",
-            format_func=lambda value: {
-                "auto": "Auto detect",
-                "continuous": "Continuous vertical pages",
-                "next-chapter": "Next chapter control",
-                "paginated": "Next page reader",
-                "mixed": "Pages plus next chapter",
-            }[value],
-        )
-        source_errors = preflight_url(str(st.session_state.ocr_start_url))
-        if st.button(
-            "Continue to output",
-            type="primary",
-            disabled=bool(source_errors),
-            width="stretch",
-        ):
-            st.session_state.capture_setup_step = 2
-            st.rerun()
-
-    elif capture_step == 2:
-        st.markdown("### Choose the output")
-        output_columns = st.columns(2)
-        with output_columns[0]:
-            st.checkbox("Save chapter images", key="ocr_save_images")
-            st.checkbox("Create CBZ archive", key="ocr_create_archive")
-            st.checkbox("Create OCR transcript", key="ocr_save_text")
-            st.text_input(
-                "Custom output folder",
-                key="ocr_custom_output_dir",
-                placeholder="Default: Workspace/manhwa",
-            )
-            output_path = Path(
-                str(st.session_state.ocr_custom_output_dir).strip() or str(OCR_DOWNLOAD_DIR)
-            ).expanduser()
-            st.caption(f"Output: {display_path(output_path)}")
-        with output_columns[1]:
-            st.selectbox(
-                "Capture performance",
-                options=["Balanced", "Rapid", "Reliable"],
-                key="ocr_performance_profile",
-                help="Balanced is recommended. Rapid reduces completeness waits and uses more parallel downloads; Reliable waits longer for difficult lazy-loaded readers.",
-            )
-            st.slider(
-                "OCR confidence",
-                min_value=0.05,
-                max_value=0.95,
-                step=0.05,
-                key="ocr_download_confidence",
-            )
-            st.caption("Each completed chapter includes metadata and discovered image URLs.")
-
-        with st.expander("Advanced configuration", expanded=False):
-            profile_columns = st.columns([3, 1])
-            profile_columns[0].selectbox(
-                "Selector profile",
-                options=list(capture_profiles),
-                key="ocr_selector_profile",
-            )
-            if profile_columns[1].button("Apply profile", key="capture_apply_profile", width="stretch"):
-                values = capture_profiles[st.session_state.ocr_selector_profile]
-                st.session_state.ocr_next_chapter_selector = values.get("next_link", "")
-                st.session_state.ocr_next_page_selector = values.get("next_page", "")
-                st.session_state.ocr_page_counter_selector = values.get("page_counter", "")
-                st.session_state.ocr_chapter_list_selector = values.get("chapter_list", "")
-                st.rerun()
-            advanced_columns = st.columns(2)
-            advanced_columns[0].text_input("Chapter container", key="ocr_container_selector")
-            advanced_columns[1].text_input("Chapter images", key="ocr_download_image_selector")
-            advanced_columns[0].text_input("Next chapter", key="ocr_next_chapter_selector")
-            advanced_columns[1].text_input("Next page", key="ocr_next_page_selector")
-            advanced_columns[0].text_input("Page counter", key="ocr_page_counter_selector")
-            advanced_columns[1].text_input("Chapter list", key="ocr_chapter_list_selector")
-            advanced_columns[0].number_input(
-                "Minimum scroll delay",
-                min_value=0.0,
-                max_value=5.0,
-                step=0.01,
-                key="ocr_scroll_min_delay",
-            )
-            advanced_columns[1].number_input(
-                "Maximum scroll delay",
-                min_value=0.0,
-                max_value=5.0,
-                step=0.01,
-                key="ocr_scroll_max_delay",
-            )
-            st.number_input(
-                "Image fetch timeout",
-                min_value=1.0,
-                max_value=120.0,
-                step=1.0,
-                key="ocr_image_fetch_timeout",
-            )
-        output_navigation = st.columns(2)
-        if output_navigation[0].button("Back", key="capture_output_back", width="stretch"):
-            st.session_state.capture_setup_step = 1
-            st.rerun()
-        if output_navigation[1].button(
-            "Continue to review",
-            key="capture_output_next",
-            type="primary",
-            width="stretch",
-        ):
-            st.session_state.capture_setup_step = 3
-            st.rerun()
-
-    effective_ocr_output_dir = str(
-        Path(str(st.session_state.ocr_custom_output_dir).strip() or str(OCR_DOWNLOAD_DIR)).expanduser()
-    )
-    effective_ocr_container_selector = (
-        str(st.session_state.ocr_container_selector).strip() or MANHWA_CONTAINER_SELECTOR
-    )
-    effective_ocr_image_selector = (
-        str(st.session_state.ocr_download_image_selector).strip() or MANHWA_IMAGE_SELECTOR
-    )
-    capture_blockers = preflight_url(str(st.session_state.ocr_start_url))
-    if float(st.session_state.ocr_scroll_max_delay) < float(st.session_state.ocr_scroll_min_delay):
-        capture_blockers.append("fix the scan timing")
-    if not str(st.session_state.ocr_next_chapter_selector).strip():
-        capture_blockers.append("add a next-chapter selector")
-    if st.session_state.ocr_reader_layout in {"paginated", "mixed"} and not str(
-        st.session_state.ocr_next_page_selector
-    ).strip():
-        capture_blockers.append("add a next-page selector")
-
-    if capture_step == 3:
-        st.markdown("### Review the capture")
-        capture_metrics = st.columns(4)
-        capture_metrics[0].metric("Target", "Ready" if not preflight_url(str(st.session_state.ocr_start_url)) else "Missing")
-        capture_metrics[1].metric("Layout", str(st.session_state.ocr_reader_layout).replace("-", " ").title())
-        capture_metrics[2].metric("Chapters", int(st.session_state.ocr_max_chapters))
-        selected_outputs = [
-            label
-            for enabled, label in (
-                (st.session_state.ocr_save_images, "Images"),
-                (st.session_state.ocr_create_archive, "CBZ"),
-                (st.session_state.ocr_save_text, "OCR"),
-            )
-            if enabled
-        ]
-        capture_metrics[3].metric("Outputs", ", ".join(selected_outputs) or "Metadata")
-        st.code(str(st.session_state.ocr_start_url), language="text")
-        st.caption(f"Output: {display_path(effective_ocr_output_dir)}")
-        st.caption(
-            "Capture uses a dedicated persistent Chrome profile. Select Review in Browser "
-            "when authentication or manual reader verification is required."
-        )
-        if capture_blockers:
-            st.warning("Before starting: " + "; ".join(capture_blockers) + ".")
-        else:
-            st.success("Configuration is ready.")
-        review_navigation = st.columns([1, 2, 2])
-        if review_navigation[0].button("Back", key="capture_review_back", width="stretch"):
-            st.session_state.capture_setup_step = 2
-            st.rerun()
-
-        def launch_capture(wait_for_inspection: bool) -> None:
-            st.session_state.bot_process, st.session_state.log_path, st.session_state.start_signal_path = start_manhwa_ocr_bot(
-                str(st.session_state.ocr_start_url).strip(),
-                int(st.session_state.ocr_max_chapters),
-                wait_for_inspection,
-                effective_ocr_output_dir,
-                effective_ocr_container_selector,
-                effective_ocr_image_selector,
-                float(st.session_state.ocr_download_confidence),
-                float(st.session_state.ocr_scroll_min_delay),
-                float(st.session_state.ocr_scroll_max_delay),
-                float(st.session_state.ocr_image_fetch_timeout),
-                bool(st.session_state.ocr_save_images),
-                bool(st.session_state.ocr_create_archive),
-                bool(st.session_state.ocr_save_text),
-                str(st.session_state.ocr_reader_layout),
-                str(st.session_state.ocr_next_chapter_selector).strip(),
-                str(st.session_state.ocr_next_page_selector).strip(),
-                str(st.session_state.ocr_page_counter_selector).strip(),
-                str(st.session_state.ocr_chapter_list_selector).strip(),
-                str(st.session_state.ocr_performance_profile),
-            )
-            set_page("Capture Live")
-            st.rerun()
-
-        inspect_clicked = review_navigation[1].button(
-            "Review in Browser",
-            key="capture_prepare",
-            disabled=running or bool(capture_blockers),
-            width="stretch",
-        )
-        direct_clicked = review_navigation[2].button(
-            "Start Capture",
-            key="capture_start",
-            type="primary",
-            disabled=running or bool(capture_blockers),
-            width="stretch",
-        )
-        if inspect_clicked:
-            launch_capture(True)
-        if direct_clicked:
-            launch_capture(False)
-
-elif route_page == "Studio Setup":
-    word_art_runtime = st.session_state.bot_runtimes["word_art"]
-    apply_note_art_selector_defaults()
-    studio_step = max(1, min(3, int(st.session_state.get("studio_setup_step", 1))))
-    st.session_state.studio_setup_step = studio_step
-    studio_step_titles = {1: "Target", 2: "Design", 3: "Review and start"}
-    render_page_header("Studio", studio_step_titles[studio_step], [f"Step {studio_step} of 3"])
-
-    if studio_step == 1:
-        st.markdown("### Choose the editor and image")
-        st.text_input(
-            "Editor URL",
-            key="note_url",
-            placeholder="https://staging.example.com/notes/new",
-        )
-        uploaded_image = st.file_uploader(
-            "Source image",
-            type=["png", "jpg", "jpeg", "webp", "gif"],
-            key="studio_upload",
-        )
-        if uploaded_image is not None:
-            safe_upload_name = re.sub(r"[^A-Za-z0-9._-]+", "_", uploaded_image.name).strip("._") or "upload.png"
-            saved_image_path = UPLOAD_DIR / safe_upload_name
-            saved_image_path.write_bytes(uploaded_image.getbuffer())
-            st.session_state.studio_image_path = str(saved_image_path)
-        image_path = Path(str(st.session_state.studio_image_path)) if st.session_state.studio_image_path else None
-        if image_path and image_path.exists():
-            st.image(str(image_path), width=420)
-        source_errors = preflight_url(str(st.session_state.note_url))
-        if image_path is None or not image_path.exists():
-            source_errors.append("Choose an image.")
-        if st.button(
-            "Continue to design",
-            type="primary",
-            disabled=bool(source_errors),
-            width="stretch",
-        ):
-            st.session_state.studio_setup_step = 2
-            st.rerun()
-
-    elif studio_step == 2:
-        st.markdown("### Design the composition")
-        design_columns = st.columns([1, 1.2])
-        with design_columns[0]:
-            st.text_input("Main text", key="word_art_text")
-            st.text_area("Caption", key="word_art_caption", height=120)
-            st.radio(
-                "Style",
-                options=["banner", "box", "stack"],
-                key="word_art_style_mode",
-                horizontal=True,
-            )
-            color_columns = st.columns(2)
-            color_columns[0].color_picker("Text", key="word_art_text_color")
-            color_columns[1].color_picker("Panel", key="word_art_panel_color")
-            st.radio(
-                "Text alignment",
-                options=["left", "center", "right"],
-                key="word_art_text_align",
-                horizontal=True,
-            )
-            st.radio(
-                "Panel placement",
-                options=["top", "bottom"],
-                key="word_art_panel_placement",
-                horizontal=True,
-            )
-            st.checkbox(
-                "Leave the editor open for review",
-                key="note_skip_submit",
-            )
-        with design_columns[1]:
-            image_path = Path(str(st.session_state.studio_image_path)) if st.session_state.studio_image_path else None
-            if image_path and image_path.exists() and str(st.session_state.word_art_text).strip():
-                try:
-                    from note_art_bot import render_word_art_image
-
-                    preview_path = render_word_art_image(
-                        image_path,
-                        str(st.session_state.word_art_text),
-                        str(st.session_state.word_art_style_mode),
-                        text_color=str(st.session_state.word_art_text_color),
-                        panel_color=str(st.session_state.word_art_panel_color),
-                        text_align=str(st.session_state.word_art_text_align),
-                        panel_placement=str(st.session_state.word_art_panel_placement),
-                    )
-                    st.session_state.studio_preview_path = str(preview_path)
-                    st.image(str(preview_path), caption="Preview", width="stretch")
-                except (OSError, ValueError) as exc:
-                    st.error(f"Preview could not be rendered: {exc}")
-            else:
-                st.info("Enter the main text to render the preview.")
-
-        with st.expander("Advanced configuration", expanded=False):
-            if st.button("Restore default selectors", key="studio_restore_selectors", width="stretch"):
-                apply_note_art_selector_defaults(force=True)
-                st.rerun()
-            selector_columns = st.columns(2)
-            selector_columns[0].text_input("File input", key="note_upload_input_selector")
-            selector_columns[1].text_input("Upload trigger", key="note_upload_trigger_selector")
-            selector_columns[0].text_input("Editor", key="note_editor_selector")
-            selector_columns[1].text_input("Save or publish", key="note_submit_selector")
-
-        design_navigation = st.columns(2)
-        if design_navigation[0].button("Back", key="studio_design_back", width="stretch"):
-            st.session_state.studio_setup_step = 1
-            st.rerun()
-        if design_navigation[1].button(
-            "Continue to review",
-            key="studio_design_next",
-            type="primary",
-            disabled=not bool(str(st.session_state.word_art_text).strip()),
-            width="stretch",
-        ):
-            st.session_state.studio_setup_step = 3
-            st.rerun()
-
-    image_path = Path(str(st.session_state.studio_image_path)) if st.session_state.studio_image_path else None
-    studio_blockers = preflight_url(str(st.session_state.note_url))
-    if image_path is None or not image_path.exists():
-        studio_blockers.append("choose an image")
-    if not str(st.session_state.word_art_text).strip():
-        studio_blockers.append("add the main text")
-    if studio_step == 3:
-        st.markdown("### Review the composition")
-        preview_path = Path(str(st.session_state.studio_preview_path)) if st.session_state.studio_preview_path else None
-        review_columns = st.columns([1.2, 1])
-        with review_columns[0]:
-            if preview_path and preview_path.exists():
-                st.image(str(preview_path), width="stretch")
-            else:
-                st.info("Return to Design to create a preview.")
-        with review_columns[1]:
-            st.metric("Style", str(st.session_state.word_art_style_mode).title())
-            st.metric("Editor action", "Review only" if st.session_state.note_skip_submit else "Save or publish")
-            st.code(str(st.session_state.note_url), language="text")
-        if studio_blockers:
-            st.warning("Before starting: " + "; ".join(studio_blockers) + ".")
-        else:
-            st.success("Composition is ready.")
-
-        review_navigation = st.columns([0.8, 1.3, 1.3])
-        if review_navigation[0].button("Back", key="studio_review_back", width="stretch"):
-            st.session_state.studio_setup_step = 2
-            st.rerun()
-        prepare_clicked = review_navigation[1].button(
-            "Open editor and prepare",
-            type="primary",
-            disabled=running or bool(studio_blockers),
-            width="stretch",
-        )
-        direct_clicked = review_navigation[2].button(
-            "Start exact URL",
-            disabled=running or bool(studio_blockers),
-            width="stretch",
-        )
-
-        def launch_studio(wait_for_setup: bool) -> None:
-            assert image_path is not None
-            st.session_state.bot_process, st.session_state.log_path, st.session_state.start_signal_path = start_note_art_bot(
-                str(st.session_state.note_url).strip(),
-                image_path,
-                str(st.session_state.word_art_text).strip(),
-                str(st.session_state.word_art_caption).strip(),
-                str(st.session_state.word_art_style_mode),
-                str(st.session_state.word_art_text_color),
-                str(st.session_state.word_art_panel_color),
-                str(st.session_state.word_art_text_align),
-                str(st.session_state.word_art_panel_placement),
-                wait_for_setup=wait_for_setup,
-                upload_input_selector=str(st.session_state.note_upload_input_selector).strip(),
-                upload_trigger_selector=str(st.session_state.note_upload_trigger_selector).strip(),
-                editor_selector=str(st.session_state.note_editor_selector).strip(),
-                submit_selector=str(st.session_state.note_submit_selector).strip(),
-                skip_submit=bool(st.session_state.note_skip_submit),
-            )
-            set_page("Studio Live")
-            st.rerun()
-
-        if prepare_clicked:
-            launch_studio(True)
-        if direct_clicked:
-            launch_studio(False)
-
-elif route_page == "Engage Live":
-    runtime = st.session_state.bot_runtimes["comment"]
-    log_path = runtime.get("log_path")
-    log_text = read_log(Path(log_path), int(st.session_state.console_max_chars)) if log_path else "No comment run started yet."
-    progress = parse_bot_progress(log_text)
-    record = load_runtime_record("comment")
-    render_page_header("Engage", "Live run", ["Comment testing"])
-    metrics = st.columns(4)
-    metrics[0].metric("State", runtime_status("comment"))
-    metrics[1].metric("Chapter", f"{progress['current']} / {progress['target']}" if progress["target"] else "Waiting")
-    metrics[2].metric("Submitted", progress["submitted"])
-    metrics[3].metric("Failures", progress["failures"])
-    completion = min(1.0, float(progress["current"]) / max(1, int(progress["target"])))
-    st.progress(completion, text=f"Chapter progress: {progress['current']} of {progress['target'] or 'pending'}")
-    st.info(str(record.get("message") or record.get("stage") or "Waiting for a run to start."))
-    if progress["stop_reason"]:
-        st.warning(f"Last stop reason: {progress['stop_reason']}")
-    actions = st.columns(3)
-    if actions[0].button(
-        "Continue in browser" if runtime.get("signal_path") else "Waiting for browser",
-        type="primary",
-        disabled=not running or runtime.get("signal_path") is None,
-        width="stretch",
-    ):
-        Path(runtime["signal_path"]).write_text("start\n", encoding="utf-8")
-        runtime["signal_path"] = None
-        st.toast("Comment workflow started.")
-        st.rerun()
-    pause_label = "Resume" if runtime.get("paused") else "Pause"
-    if actions[1].button(pause_label, disabled=not running, width="stretch"):
-        changed = resume_bot(runtime.get("process")) if runtime.get("paused") else pause_bot(runtime.get("process"))
-        if changed:
-            runtime["paused"] = not runtime.get("paused", False)
-            st.rerun()
-    if actions[2].button("Stop", disabled=not running, width="stretch"):
-        stop_bot(runtime.get("process"))
-        runtime["paused"] = False
-        st.rerun()
-    if not running and not log_path:
-        if st.button("Configure a run", width="stretch"):
-            set_page("Engage Setup")
-            st.rerun()
-    with st.expander("Diagnostics", expanded=bool(progress["stop_reason"])):
-        if progress["stop_reason"] and st.button("Return to review and retry", width="stretch"):
-            st.session_state.engage_setup_step = 3
-            set_page("Engage Setup")
-            st.rerun()
-        st.code(log_text, language="text")
-
-elif route_page == "Capture Live":
-    runtime = st.session_state.bot_runtimes["download"]
-    log_path = runtime.get("log_path")
-    log_text = read_log(Path(log_path), int(st.session_state.console_max_chars)) if log_path else "No download run started yet."
-    progress = parse_ocr_progress(log_text)
-    record = load_runtime_record("download")
-    render_page_header("Capture", "Live run", ["Chapter capture"])
-    saved_matches = re.findall(r"Saved\s+(\d+)/(\d+)\s+raw image", log_text, re.IGNORECASE)
-    saved_label = f"{saved_matches[-1][0]} / {saved_matches[-1][1]}" if saved_matches else "0"
-    reader_matches = re.findall(r"Reader media progress:\s*(\d+)/(\d+)", log_text, re.IGNORECASE)
-    reader_label = f"{reader_matches[-1][0]} / {reader_matches[-1][1]}" if reader_matches else "Not detected"
-    metrics = st.columns(4)
-    metrics[0].metric("State", runtime_status("download"))
-    metrics[1].metric("Chapter", f"{progress['current']} / {progress['target']}" if progress["target"] else "Waiting")
-    metrics[2].metric("Reader page", reader_label)
-    metrics[3].metric("Images", saved_label)
-    completion = min(1.0, float(progress["current"]) / max(1, int(progress["target"])))
-    st.progress(completion, text=f"Chapter progress: {progress['current']} of {progress['target'] or 'pending'}")
-    st.info(str(record.get("message") or record.get("stage") or "Waiting for a run to start."))
-    actions = st.columns(4)
-    if actions[0].button(
-        "Begin Capture" if runtime.get("signal_path") else "Browser Review Complete",
-        type="primary",
-        disabled=not running or runtime.get("signal_path") is None,
-        width="stretch",
-    ):
-        Path(runtime["signal_path"]).write_text("start\n", encoding="utf-8")
-        runtime["signal_path"] = None
-        st.session_state.start_signal_path = None
-        st.toast("Capture initiated from the active browser page.")
-        st.rerun()
-    pause_label = "Resume" if runtime.get("paused") else "Pause"
-    if actions[1].button(pause_label, disabled=not running, width="stretch"):
-        changed = resume_bot(runtime.get("process")) if runtime.get("paused") else pause_bot(runtime.get("process"))
-        if changed:
-            runtime["paused"] = not runtime.get("paused", False)
-            st.rerun()
-    if actions[2].button("Stop", disabled=not running, width="stretch"):
-        stop_bot(runtime.get("process"))
-        runtime["paused"] = False
-        st.rerun()
-    if actions[3].button("Open output", width="stretch"):
-        output_path = Path(st.session_state.ocr_custom_output_dir.strip() or OCR_DOWNLOAD_DIR)
-        output_path.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["open", str(output_path)], check=False)
-    if not running and not log_path:
-        if st.button("Configure a capture", width="stretch"):
-            set_page("Capture Setup")
-            st.rerun()
-    with st.expander("Diagnostics", expanded=bool(progress["failures"])):
-        if progress["failures"] and st.button("Return to review and retry", key="capture_retry", width="stretch"):
-            st.session_state.capture_setup_step = 3
-            set_page("Capture Setup")
-            st.rerun()
-        st.code(log_text, language="text")
-
-elif route_page == "Studio Live":
-    runtime = st.session_state.bot_runtimes["word_art"]
-    log_path = runtime.get("log_path")
-    log_text = read_log(Path(log_path), int(st.session_state.console_max_chars)) if log_path else "No Word Art run started yet."
-    progress = parse_word_art_progress(log_text)
-    record = load_runtime_record("word_art")
-    render_page_header("Studio", "Live run", ["Editor automation"])
-    metrics = st.columns(4)
-    metrics[0].metric("State", runtime_status("word_art"))
-    metrics[1].metric("Stages", f"{progress['current']} / {progress['target']}")
-    metrics[2].metric("Upload", "Done" if "WORD_ART_UPLOAD_VERIFIED" in log_text else "Waiting")
-    metrics[3].metric("Save", "Done" if "WORD_ART_SAVE_VERIFIED" in log_text else "Waiting")
-    st.progress(
-        min(1.0, float(progress["current"]) / max(1, int(progress["target"]))),
-        text=f"Stage progress: {progress['current']} of {progress['target']}",
-    )
-    previews = sorted(UPLOAD_DIR.glob("*-word-art.png"), key=lambda item: item.stat().st_mtime, reverse=True)
-    if previews:
-        st.image(str(previews[0]), caption="Latest rendered Word Art", width=480)
-    st.info(str(record.get("message") or record.get("stage") or "Waiting for a run to start."))
-    actions = st.columns(3)
-    if actions[0].button(
-        "Continue in browser" if runtime.get("signal_path") else "Waiting for browser",
-        type="primary",
-        disabled=not running or runtime.get("signal_path") is None,
-        width="stretch",
-    ):
-        Path(runtime["signal_path"]).write_text("start\n", encoding="utf-8")
-        runtime["signal_path"] = None
-        st.rerun()
-    pause_label = "Resume" if runtime.get("paused") else "Pause"
-    if actions[1].button(pause_label, disabled=not running, width="stretch"):
-        changed = resume_bot(runtime.get("process")) if runtime.get("paused") else pause_bot(runtime.get("process"))
-        if changed:
-            runtime["paused"] = not runtime.get("paused", False)
-            st.rerun()
-    if actions[2].button("Stop", disabled=not running, width="stretch"):
-        stop_bot(runtime.get("process"))
-        runtime["paused"] = False
-        st.rerun()
-    if not running and not log_path:
-        if st.button("Configure a composition", width="stretch"):
-            set_page("Studio Setup")
-            st.rerun()
-    with st.expander("Diagnostics", expanded=False):
-        st.code(log_text, language="text")
-
-elif route_page == "Reader":
-    render_page_header(
-        "Reader",
-        "Read locally collected chapters in their original continuous vertical format.",
-        ["Vertical reading", "Original and clean editions", "Local files"],
-    )
-    catalog = reader_catalog()
-    if not catalog:
-        st.info("No chapter images are available yet. Run Capture first, then return here to read them.")
-    else:
-        series_options = sorted(catalog, key=lambda key: str(catalog[key]["title"]).lower())
-        if st.session_state.reader_series not in series_options:
-            st.session_state.reader_series = series_options[0]
-        selected_series = st.selectbox(
-            "Series",
-            options=series_options,
-            key="reader_series",
-            format_func=lambda key: str(catalog[key]["title"]),
-        )
-        selected_entry = catalog[selected_series]
-        editions = selected_entry["editions"]
-        edition_options = [edition for edition in ("Original", "Clean") if edition in editions]
-        if st.session_state.reader_edition not in edition_options:
-            st.session_state.reader_edition = edition_options[0]
-        st.radio(
-            "Edition",
-            options=edition_options,
-            key="reader_edition",
-            horizontal=True,
-            help="Clean removes verified promotional bands while preserving the original source files.",
-        )
-        chapters = editions[st.session_state.reader_edition]
-        chapter_options = sorted(chapters, key=lambda value: (0, int(value)) if value.isdigit() else (1, value))
-        if st.session_state.reader_chapter not in chapter_options:
-            st.session_state.reader_chapter = chapter_options[0]
-
-        navigation = st.columns([1, 2, 1])
-        current_index = chapter_options.index(st.session_state.reader_chapter)
-        if navigation[0].button("Previous", disabled=current_index == 0, width="stretch"):
-            st.session_state.reader_chapter = chapter_options[current_index - 1]
-            request_scroll_to_top()
-            st.rerun()
-        navigation[1].selectbox(
-            "Chapter",
-            options=chapter_options,
-            key="reader_chapter",
-            format_func=lambda value: f"Chapter {value}",
-        )
-        if navigation[2].button("Next", disabled=current_index == len(chapter_options) - 1, width="stretch"):
-            st.session_state.reader_chapter = chapter_options[current_index + 1]
-            request_scroll_to_top()
-            st.rerun()
-
-        chapter = chapters[st.session_state.reader_chapter]
-        images = chapter["images"]
-        st.caption(
-            f"{st.session_state.reader_edition} edition · Chapter {st.session_state.reader_chapter} · {len(images)} image(s)"
-        )
-        reader_url = local_reader_service().reader_url(
-            st.session_state.reader_edition,
-            selected_series,
-            st.session_state.reader_chapter,
-        )
-        st.link_button("Open immersive reader", reader_url, type="primary", width="stretch")
-        st.caption("Opens a local, distraction-free reader with resume position, width modes, keyboard controls, and zero panel spacing.")
-
-elif route_page == "Capture Library":
-    render_page_header(
-        "Capture Library",
-        "Browse downloaded chapters, real image counts, CBZ archives, OCR output, and storage locations.",
-        ["Chapter images", "CBZ archives", "OCR files"],
-    )
-    output_roots = {OCR_DOWNLOAD_DIR}
-    if st.session_state.ocr_custom_output_dir.strip():
-        output_roots.add(Path(st.session_state.ocr_custom_output_dir).expanduser())
-    metadata_files = sorted(
-        (path for root in output_roots if root.exists() for path in root.rglob("metadata.json")),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
-    if not metadata_files:
-        st.info("No downloaded chapters were found. Start from Capture Setup.")
-    else:
-        library_rows = []
-        for metadata_file in metadata_files:
-            try:
-                metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            images_dir = Path(str(metadata.get("images_dir") or metadata_file.parent / "images"))
-            actual_images = len([
-                item for item in images_dir.glob("*")
-                if item.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-            ]) if images_dir.exists() else 0
-            archive = str(metadata.get("archive_file") or metadata_file.parent / "chapter-pages.cbz")
-            library_rows.append(
-                {
-                    "Chapter": metadata.get("title", metadata_file.parent.name),
-                    "Images": actual_images,
-                    "OCR characters": metadata.get("character_count", 0),
-                    "Images folder": display_path(images_dir),
-                    "CBZ": display_path(Path(archive)) if Path(archive).exists() else "not created",
-                    "_images_dir": str(images_dir),
-                }
-            )
-        st.dataframe(
-            [{key: value for key, value in row.items() if not key.startswith("_")} for row in library_rows],
-            width="stretch",
-            hide_index=True,
-        )
-        latest_images_dir = Path(library_rows[0]["_images_dir"]) if library_rows else OCR_DOWNLOAD_DIR
-        actions = st.columns(3)
-        if actions[0].button("Open Latest Images", width="stretch"):
-            subprocess.run(["open", str(latest_images_dir)], check=False)
-        if actions[1].button("Open Download Folder", width="stretch"):
-            subprocess.run(["open", str(next(iter(output_roots)))], check=False)
-        if actions[2].button("New Download", width="stretch"):
-            set_page("Capture Setup")
-            st.rerun()
-
-elif route_page == "Studio Library":
-    render_page_header(
-        "Studio Library",
-        "Review generated visual compositions independently from comment and download data.",
-        ["Rendered PNGs", "Source uploads", "Note assets"],
-    )
-    generated_images = sorted(UPLOAD_DIR.glob("*-word-art.png"), key=lambda item: item.stat().st_mtime, reverse=True)
-    if not generated_images:
-        st.info("No rendered Word Art images were found. Start from Studio Setup.")
-    else:
-        for row_start in range(0, min(len(generated_images), 18), 3):
-            columns = st.columns(3)
-            for column, image_path in zip(columns, generated_images[row_start:row_start + 3]):
-                with column:
-                    st.image(str(image_path), width="stretch")
-                    st.caption(image_path.name)
-        if st.button("Open Word Art Files", width="stretch"):
-            subprocess.run(["open", str(UPLOAD_DIR)], check=False)
-
-elif route_page == "Assistant":
-    context = build_copilot_context(history_records)
-    render_page_header(
-        "Panelyra Copilot",
-        "Grounded help, run diagnostics, workflow configuration, and user support.",
-        ["Local evidence", "Controlled actions", "Multi-turn context"],
-    )
-    metrics = st.columns(4)
-    metrics[0].metric("Current page", context.current_page)
-    metrics[1].metric(
-        "Browser",
-        "Busy" if context.browser_owner else (
-            "Inspected" if context.browser_snapshot.get("available") else "Available"
-        ),
-    )
-    metrics[2].metric(
-        "Active runs",
-        sum(1 for run in context.runs.values() if run.status in {"running", "starting"}),
-    )
-    metrics[3].metric(
-        "Open tickets",
-        sum(1 for ticket in context.tickets if str(ticket.get("status", "open")) == "open"),
-    )
-    failed_runs = [
-        workspace.title()
-        for workspace, run in context.runs.items()
-        if run.status == "failed"
-    ]
-    if context.browser_owner:
-        st.warning(
-            f"Chrome is currently owned by {context.browser_owner.get('bot_type', 'another Panelyra workflow')}. "
-            "Diagnose or wait for that workflow before preparing another browser run."
-        )
-    elif failed_runs:
-        st.info(
-            f"Recent failed workspace: {', '.join(failed_runs)}. Select Diagnose mode to inspect its evidence and prepare a retry."
-        )
-
-    run_rows = [
-        {
-            "Workspace": workspace.title(),
-            "Status": run.status,
-            "Stage": run.stage or "not started",
-            "Progress": (
-                f"{run.progress_current}/{run.progress_total}"
-                if run.progress_total
-                else "-"
-            ),
-            "Findings": len(run.events),
-        }
-        for workspace, run in context.runs.items()
-    ]
-    with st.expander("Live context", expanded=False):
-        st.dataframe(run_rows, width="stretch", hide_index=True)
-        if context.browser_snapshot:
-            snapshot = context.browser_snapshot
-            st.markdown(
-                f"**Browser tab:** {snapshot.get('title', 'Unavailable')}  \n"
-                f"**URL:** `{snapshot.get('url', '')}`"
-            )
-            screenshot_path = Path(str(snapshot.get("screenshot_path", "")))
-            if screenshot_path.is_file():
-                st.image(str(screenshot_path), caption="Latest local browser inspection")
-            with st.expander("DOM summary", expanded=False):
-                st.json(
-                    {
-                        "text_excerpt": str(snapshot.get("text_excerpt", ""))[:2_000],
-                        "buttons": snapshot.get("buttons", []),
-                        "inputs": snapshot.get("inputs", []),
-                    }
-                )
-
-    toolbar = st.columns([1, 1, 2])
-    if toolbar[0].button("Clear conversation", width="stretch"):
-        st.session_state.assistant_messages = []
-        st.rerun()
-    if toolbar[1].button("Inspect Chrome", width="stretch"):
-        st.session_state.assistant_action_notice = execute_copilot_action(
-            {
-                "kind": "inspect_browser",
-                "payload": {"include_screenshot": True},
-            }
-        )
-        st.rerun()
-    toolbar[2].caption(
-        "The copilot can fill forms and prepare retries, but it never starts, stops, submits, deletes, or publishes without a separate user action."
-    )
-    render_copilot_chat(history_records, key_prefix="assistant_page", history_limit=30)
-
-elif route_page == "Run History":
-    render_page_header(
-        "Run History",
-        "Search, inspect, export, and retry durable records from every Panelyra workspace.",
-        ["Searchable records", "JSON export", "Retry setup"],
-    )
-    records = list_run_records(limit=100)
-    filter_columns = st.columns([2, 1, 1])
-    history_search = filter_columns[0].text_input(
-        "Search",
-        key="run_history_search",
-        placeholder="Run ID, stage, URL, or stop reason",
-    ).strip().lower()
-    bot_filter = filter_columns[1].selectbox(
-        "Workspace",
-        options=["All", "Engage", "Capture", "Studio"],
-    )
-    status_filter = filter_columns[2].selectbox(
-        "Status",
-        options=["All", "running", "completed", "partial", "failed", "stopped"],
-    )
-    bot_values = {"Engage": "comment", "Capture": "download", "Studio": "word_art"}
-    if bot_filter != "All":
-        records = [record for record in records if record.get("bot_type") == bot_values[bot_filter]]
-    if status_filter != "All":
-        records = [record for record in records if str(record.get("status", "")).lower() == status_filter]
-    if history_search:
-        records = [
-            record
-            for record in records
-            if history_search in json.dumps(record, ensure_ascii=False).lower()
-        ]
-    st.download_button(
-        "Export visible run report",
-        data=json.dumps(records, indent=2, ensure_ascii=False),
-        file_name=f"panelyra-run-report-{time.strftime('%Y%m%d-%H%M%S')}.json",
-        mime="application/json",
-        disabled=not records,
-        width="stretch",
-    )
-    if not records:
-        st.info("No matching runs were found. Start a workspace from the Dashboard.")
-    else:
-        for record in records:
-            with st.expander(
-                f"{record.get('bot_type', 'bot').replace('_', ' ').title()} · {record.get('status', 'unknown')} · {record.get('run_id', '')}",
-                expanded=False,
-            ):
-                cols = st.columns(4)
-                cols[0].metric("Stage", record.get("stage", "unknown"))
-                cols[1].metric("Progress", f"{record.get('progress_current', 0)} / {record.get('progress_total', 0)}")
-                cols[2].metric("PID", record.get("pid", 0) or "n/a")
-                cols[3].metric("Updated", time.strftime("%Y-%m-%d %H:%M", time.localtime(record.get("updated_at", 0))))
-                if record.get("stop_reason"):
-                    st.error(str(record["stop_reason"]))
-                st.code(redact_private_paths(json.dumps(record.get("settings", {}), indent=2)), language="json")
-                if record.get("log_path"):
-                    st.caption(display_path(record["log_path"]))
-                if st.button(
-                    "Retry from saved configuration",
-                    key=f"retry_{record.get('run_id', uuid.uuid4().hex)}",
-                    width="stretch",
-                ):
-                    restore_run_configuration(record)
-                    st.rerun()
-
-elif route_page == "Engage Insights":
-    records = history_records
-    render_page_header(
-        "Engage Insights",
-        "Review generated comment history, balance style variety, and inspect repeated keywords.",
-        [f"{len(COMMENT_STYLES)} styles", "History analytics", "Research source tracking"],
-    )
-    st.markdown("### JSONL Metrics")
-    st.divider()
-    with st.container(border=True):
-        render_jsonl_metric_grid(records, columns=4)
-        st.info(style_recommendation(records))
-
-    if records:
-        style_counts = Counter(str(record.get("style", "unknown")) for record in records)
-        research_counts = Counter(str(record.get("research_source", "chapter-only") or "chapter-only") for record in records)
-        keyword_counts = Counter(str(record.get("keyword", "")).lower() for record in records if str(record.get("keyword", "")).strip())
-        st.markdown("### Analysis Charts")
-        st.divider()
-        with st.container(border=True):
-            chart_cols = st.columns(3)
-            chart_cols[0].bar_chart([{"style": style, "count": count} for style, count in style_counts.items()], x="style", y="count")
-            chart_cols[1].bar_chart([{"source": source, "count": count} for source, count in research_counts.items()], x="source", y="count")
-            chart_cols[2].bar_chart(
-                [{"keyword": keyword, "count": count} for keyword, count in keyword_counts.most_common(int(st.session_state.top_keywords))],
-                x="keyword",
-                y="count",
-            )
-
-        recent_rows = [
-            {
-                "chapter": record.get("chapter_index"),
-                "style": record.get("style"),
-                "keyword": record.get("keyword"),
-                "emoji": "yes" if record.get("emoji_used") else "no",
-                "reflection": "yes" if record.get("reflection_used") else "no",
-                "research": record.get("research_source") or "chapter-only",
-                "comment": record.get("comment"),
-            }
-            for record in records[-int(st.session_state.history_rows):]
-        ]
-        st.markdown("### Recent Records")
-        st.divider()
-        with st.container(border=True):
-            st.dataframe(recent_rows, width="stretch", hide_index=True)
-    else:
-        render_panel("No History Yet", f"History will appear after a run writes records to {HISTORY_FILE.name}.")
-
-elif route_page == "Storage":
-    render_page_header(
-        "Storage",
-        "Inspect generated artifacts, apply retention policies, and preserve protected content.",
-        ["Usage report", "Guarded cleanup", "Legacy compatibility"],
-    )
-    report = storage_report()
-    total_bytes = sum(int(item["bytes"]) for item in report)
-    total_files = sum(int(item["files"]) for item in report)
-    storage_metrics = st.columns(4)
-    storage_metrics[0].metric("Managed storage", format_bytes(total_bytes))
-    storage_metrics[1].metric("Managed files", total_files)
-    storage_metrics[2].metric("Retention", f"{int(st.session_state.retention_days)} days")
-    storage_metrics[3].metric("Rollback snapshot", "Available")
-
-    st.markdown("### Storage Areas")
-    st.dataframe(
-        [
-            {
-                "Area": item["label"],
-                "Size": item["size"],
-                "Files": item["files"],
-                "Automatic cleanup": "Allowed" if item["clearable"] else "Protected",
-                "Path": item["path"],
-            }
-            for item in report
-        ],
-        width="stretch",
-        hide_index=True,
-    )
-
-    with st.container(border=True):
-        st.markdown("#### Retention Policy")
-        retention_days = st.number_input(
-            "Keep generated logs and records for at least",
-            min_value=1,
-            max_value=3650,
-            step=1,
-            key="retention_days",
-            help="Cleanup removes only files at least this old from an explicitly selected generated area.",
-        )
-        cleanup_options = {
-            str(item["label"]): str(item["key"])
-            for item in report
-            if bool(item["clearable"])
-        }
-        cleanup_label = st.selectbox("Generated area", options=list(cleanup_options))
-        cleanup_confirmation = st.text_input(
-            "Type CLEAN to confirm",
-            key="storage_cleanup_confirmation",
-            placeholder="CLEAN",
-        )
-        if st.button(
-            "Apply retention cleanup",
-            disabled=cleanup_confirmation != "CLEAN",
-            width="stretch",
-        ):
-            removed_files, removed_bytes = prune_generated_files(
-                cleanup_options[cleanup_label],
-                int(retention_days),
-            )
-            save_preferences(
-                {
-                    "onboarding_complete": bool(st.session_state.onboarding_complete),
-                    "authorization_confirmed": bool(st.session_state.authorization_confirmed),
-                    "retention_days": int(retention_days),
-                }
-            )
-            st.success(f"Removed {removed_files} file(s), releasing {format_bytes(removed_bytes)}.")
-            st.rerun()
-
-    st.info(
-        "Capture downloads, Studio assets, history, read markers, and legacy OCR output are protected. "
-        "Panelyra never deletes those areas automatically."
-    )
-    st.caption("Migration rollback snapshot is stored in the Panelyra workspace.")
-
-elif route_page == "Settings":
-    render_page_header(
-        "Settings",
-        "Configure Panelyra Control, reusable workflows, privacy, and local integrations.",
-        ["Preferences", "Workflow presets", "Local integrations"],
-    )
-    settings_left, settings_right = st.columns(2)
-    with settings_left:
-        st.markdown("#### Dashboard")
-        st.selectbox(
-            "Default landing page",
-            options=PAGES,
-            key="default_landing_page",
-            help="Used the next time the app opens a fresh session.",
-        )
-        st.toggle(
-            "Compact UI",
-            key="compact_ui",
-            help="Reduces padding and card height for denser controls.",
-        )
-        st.toggle(
-            "Show paths in sidebar",
-            key="show_sidebar_paths",
-            help="Shows or hides workspace labels in the left navigation without revealing local paths.",
-        )
-        st.number_input(
-            "Console characters",
-            min_value=5_000,
-            max_value=200_000,
-            step=5_000,
-            key="console_max_chars",
-            help="How much of the latest run log appears in each bot's Live Room.",
-        )
-        st.select_slider(
-            "Auto-refresh seconds",
-            options=[1, 2, 3, 5, 10],
-            key="auto_refresh_seconds",
-            help="Refresh interval while a bot run is active.",
-        )
-
-    with settings_right:
-        st.markdown("#### Comments And Intelligence")
-        st.number_input(
-            "Quote/philosophy cadence",
-            min_value=2,
-            max_value=20,
-            step=1,
-            key="reflection_every_n_comments",
-            help="Every Nth generated comment gets a famous-person/philosophical reflection.",
-        )
-        st.number_input(
-            "History rows shown",
-            min_value=5,
-            max_value=200,
-            step=5,
-            key="history_rows",
-            help="How many recent comment records appear in Intelligence.",
-        )
-        st.number_input(
-            "Top keywords shown",
-            min_value=3,
-            max_value=30,
-            step=1,
-            key="top_keywords",
-            help="How many keyword bars appear in Intelligence.",
-        )
-        st.markdown("#### Assistant")
-        st.toggle(
-            "Enable floating AI button",
-            key="assistant_enabled",
-            help="Shows the compact Panelyra Copilot on every page except the full Assistant workspace.",
-        )
-        st.toggle(
-            "Use configured AI model",
-            key="assistant_use_model",
-            help="Enhances grounded local answers with the configured model when OPENAI_API_KEY is available.",
-        )
-        st.toggle(
-            "Show answer evidence",
-            key="assistant_show_evidence",
-            help="Shows run records, log findings, browser state, and knowledge entries supporting each answer.",
-        )
-        st.toggle(
-            "Allow browser inspection",
-            key="assistant_allow_browser_inspection",
-            help="Allows user-confirmed read-only DOM summaries and local screenshots from Chrome on port 9222.",
-        )
-        st.number_input(
-            "Assistant history limit",
-            min_value=10,
-            max_value=500,
-            step=10,
-            key="assistant_history_limit",
-            help="How many recent history records the assistant reviews.",
-        )
-        st.text_input(
-            "Internet survey endpoint",
-            key="assistant_internet_endpoint",
-            placeholder="http://127.0.0.1:8000/search",
-            help="Optional. Called as endpoint?q=<question> when the assistant is asked to survey the internet.",
-        )
-        st.text_input(
-            "Assistant model",
-            key="assistant_model",
-            help="OpenAI model used when OPENAI_API_KEY is set. You can also set OPENAI_MODEL before launching the app.",
-        )
-        st.toggle(
-            "Use model web search",
-            key="assistant_use_openai_web",
-            help="Used only when Ask mode explicitly requests current external research. Site help and diagnostics remain local.",
-        )
-        st.caption("For model-backed answers, put `OPENAI_API_KEY=sk-...` in `.env`, then restart Streamlit.")
-        st.markdown("#### Current Values")
-        st.table(
-            [
-                {"setting": "Default page", "value": st.session_state.default_landing_page},
-                {"setting": "Compact UI", "value": "on" if st.session_state.compact_ui else "off"},
-                {"setting": "Sidebar paths", "value": "shown" if st.session_state.show_sidebar_paths else "hidden"},
-                {"setting": "Console length", "value": f"{int(st.session_state.console_max_chars):,} chars"},
-                {"setting": "Auto-refresh", "value": f"{int(st.session_state.auto_refresh_seconds)}s"},
-                {"setting": "Quote cadence", "value": f"1 every {int(st.session_state.reflection_every_n_comments)} comments"},
-                {"setting": "History rows", "value": str(int(st.session_state.history_rows))},
-                {"setting": "Top keywords", "value": str(int(st.session_state.top_keywords))},
-                {"setting": "AI button", "value": "enabled" if st.session_state.assistant_enabled else "disabled"},
-                {"setting": "Model enhancement", "value": "enabled" if st.session_state.assistant_use_model else "disabled"},
-                {"setting": "Evidence", "value": "shown" if st.session_state.assistant_show_evidence else "hidden"},
-                {"setting": "Browser inspection", "value": "allowed" if st.session_state.assistant_allow_browser_inspection else "disabled"},
-                {"setting": "Assistant history", "value": str(int(st.session_state.assistant_history_limit))},
-                {"setting": "Internet endpoint", "value": st.session_state.assistant_internet_endpoint or "not configured"},
-                {"setting": "Model", "value": st.session_state.assistant_model},
-                {"setting": ".env file", "value": str(ENV_FILE)},
-                {"setting": "OpenAI key", "value": "available" if openai_api_key_available() else "missing"},
-                {"setting": "Model web search", "value": "on" if st.session_state.assistant_use_openai_web else "off"},
-                {"setting": "Product version", "value": PRODUCT_VERSION},
-                {"setting": "Operating mode", "value": PRODUCT_MODE},
-            ]
-        )
-
-    with st.expander("Saved Workflow Presets", expanded=False):
-        st.text_input(
-            "Preset name",
-            key="saved_preset_name",
-            placeholder="My staging reader",
-        )
-        if st.button(
-            "Save current Engage preset",
-            disabled=not st.session_state.saved_preset_name.strip(),
-            width="stretch",
-        ):
-            presets = load_presets()
-            presets[st.session_state.saved_preset_name.strip()] = {
-                "scroll_preset": st.session_state.scroll_preset,
-                "chapter_routing": st.session_state.chapter_routing,
-                "max_chapters": int(st.session_state.max_chapters),
-                "use_thanks_marker": bool(st.session_state.use_thanks_marker),
-            }
-            save_presets(presets)
-            st.session_state.selected_workflow_preset = st.session_state.saved_preset_name.strip()
-            st.success("Workflow preset saved locally.")
-            st.rerun()
-
-    with st.expander("Named Selector Profiles", expanded=False):
-        profiles = load_selector_profiles()
-        active_profile_name = (
-            st.session_state.selected_selector_profile
-            if st.session_state.selected_selector_profile in profiles
-            else next(iter(profiles))
-        )
-        st.caption(
-            f"Current source: {active_profile_name}. Edit selectors from Engage Setup, then save them under a reusable name."
-        )
-        st.text_input(
-            "New selector profile name",
-            key="selector_profile_name",
-            placeholder="Owned staging reader",
-        )
-        if st.button(
-            "Save current selectors",
-            disabled=not st.session_state.selector_profile_name.strip(),
-            width="stretch",
-        ):
-            fallback_profile = profiles[active_profile_name]
-            profiles[st.session_state.selector_profile_name.strip()] = {
-                "next_link": str(
-                    st.session_state.get("engage_next_link_selector", fallback_profile["next_link"])
-                ),
-                "next_page": str(
-                    st.session_state.get("engage_next_page_selector", fallback_profile["next_page"])
-                ),
-                "page_counter": str(
-                    st.session_state.get("engage_page_counter_selector", fallback_profile["page_counter"])
-                ),
-                "chapter_list": str(
-                    st.session_state.get("engage_chapter_list_selector", fallback_profile["chapter_list"])
-                ),
-                "comment_editor": str(
-                    st.session_state.get("engage_comment_editor_selector", fallback_profile["comment_editor"])
-                ),
-                "submit": str(
-                    st.session_state.get("engage_submit_button_selector", fallback_profile["submit"])
-                ),
-                "thanks": str(
-                    st.session_state.get("engage_thanks_button_selector", fallback_profile["thanks"])
-                ),
-                "confirmation": str(
-                    st.session_state.get("engage_confirmation_selector", fallback_profile["confirmation"])
-                ),
-            }
-            save_selector_profiles(profiles)
-            st.session_state.selected_selector_profile = st.session_state.selector_profile_name.strip()
-            st.success("Selector profile saved locally.")
-            st.rerun()
-
-    with st.expander("Environment Health", expanded=False):
-        st.dataframe(environment_health(), width="stretch", hide_index=True)
-
-    with st.expander("Local Data And Licensing", expanded=False):
-        st.markdown(
-            f"""
-            **{PRODUCT_NAME} runs locally.** Browser sessions, run records, captures, comments, and generated assets remain on this computer unless you configure an external provider or export them.
-
-            Account and license integration is intentionally isolated from the automation engines. This build does not require an online Panelyra account and does not include telemetry.
-            """
-        )
-        if st.button("Save local privacy preferences", width="stretch"):
-            save_preferences(
-                {
-                    "onboarding_complete": bool(st.session_state.onboarding_complete),
-                    "authorization_confirmed": bool(st.session_state.authorization_confirmed),
-                    "retention_days": int(st.session_state.retention_days),
-                }
-            )
-            st.success("Local preferences saved.")
-
-    with st.expander("Assistant Quality", expanded=False):
-        feedback_records = read_jsonl_records(ASSISTANT_FEEDBACK_FILE)
-        helpful_count = sum(
-            1 for record in feedback_records if str(record.get("rating", "")) == "helpful"
-        )
-        needs_work_count = sum(
-            1 for record in feedback_records if str(record.get("rating", "")) == "needs_work"
-        )
-        quality_columns = st.columns(4)
-        quality_columns[0].metric("Rated answers", len(feedback_records))
-        quality_columns[1].metric("Helpful", helpful_count)
-        quality_columns[2].metric("Needs work", needs_work_count)
-        quality_columns[3].metric(
-            "Helpful rate",
-            f"{(helpful_count / max(1, len(feedback_records))) * 100:.0f}%",
-        )
-        if feedback_records:
-            st.dataframe(
-                [
-                    {
-                        "time": record.get("timestamp", ""),
-                        "rating": record.get("rating", ""),
-                        "mode": record.get("mode", ""),
-                        "page": record.get("page", ""),
-                        "response": str(record.get("response", ""))[:220],
-                    }
-                    for record in reversed(feedback_records[-50:])
-                ],
-                width="stretch",
-                hide_index=True,
-            )
-        else:
-            st.info("No assistant answers have been rated yet.")
-
-    with st.expander("Support Requests", expanded=False):
-        requests = read_owner_requests()
-        open_requests = [request for request in requests if str(request.get("status", "open")) == "open"]
-        support_cols = st.columns(4)
-        support_cols[0].metric("Total requests", len(requests))
-        support_cols[1].metric("Open", len(open_requests))
-        support_cols[2].metric("Request file", "Ready" if OWNER_REQUESTS_FILE.exists() else "Empty")
-        support_cols[3].metric("Bot state", status_label)
-
-        if requests:
-            rows = [
-                {
-                    "id": str(request.get("id", "")),
-                    "time": str(request.get("timestamp", "")),
-                    "status": str(request.get("status", "")),
-                    "page": str(request.get("page", "")),
-                    "bot": str(request.get("bot_status", "")),
-                    "request": str(request.get("request", "")),
-                    "log findings": " | ".join(str(item) for item in request.get("latest_log_findings", [])[:3])
-                    if isinstance(request.get("latest_log_findings"), list)
-                    else "",
-                }
-                for request in reversed(requests)
-            ]
-            st.dataframe(rows, width="stretch", hide_index=True)
-            ticket_ids = [str(request.get("id", "")) for request in reversed(requests)]
-            if st.session_state.assistant_selected_ticket not in ticket_ids:
-                st.session_state.assistant_selected_ticket = ticket_ids[0]
-            selected_ticket_id = st.selectbox(
-                "Manage ticket",
-                options=ticket_ids,
-                key="assistant_selected_ticket",
-            )
-            selected_ticket = next(
-                request for request in requests if str(request.get("id", "")) == selected_ticket_id
-            )
-            ticket_columns = st.columns(3)
-            status_value = str(selected_ticket.get("status", "open"))
-            severity_value = str(selected_ticket.get("severity", "medium"))
-            ticket_status = ticket_columns[0].selectbox(
-                "Status",
-                options=list(TICKET_STATUSES),
-                index=list(TICKET_STATUSES).index(status_value)
-                if status_value in TICKET_STATUSES
-                else 0,
-                key=f"ticket_status_{selected_ticket_id}",
-            )
-            ticket_severity = ticket_columns[1].selectbox(
-                "Severity",
-                options=list(TICKET_SEVERITIES),
-                index=list(TICKET_SEVERITIES).index(severity_value)
-                if severity_value in TICKET_SEVERITIES
-                else 1,
-                key=f"ticket_severity_{selected_ticket_id}",
-            )
-            ticket_category = ticket_columns[2].text_input(
-                "Category",
-                value=str(selected_ticket.get("category", "workflow")),
-                key=f"ticket_category_{selected_ticket_id}",
-            )
-            ticket_reply = st.text_area(
-                "User-facing reply",
-                value=str(selected_ticket.get("user_reply", "")),
-                key=f"ticket_reply_{selected_ticket_id}",
-            )
-            ticket_note = st.text_area(
-                "Internal note",
-                value=str(selected_ticket.get("internal_note", "")),
-                key=f"ticket_note_{selected_ticket_id}",
-            )
-            ticket_resolution = st.text_area(
-                "Resolution",
-                value=str(selected_ticket.get("resolution", "")),
-                key=f"ticket_resolution_{selected_ticket_id}",
-            )
-            if st.button("Update support ticket", width="stretch"):
-                update_ticket(
-                    OWNER_REQUESTS_FILE,
-                    selected_ticket_id,
-                    {
-                        "status": ticket_status,
-                        "severity": ticket_severity,
-                        "category": ticket_category,
-                        "user_reply": ticket_reply,
-                        "internal_note": ticket_note,
-                        "resolution": ticket_resolution,
-                    },
-                )
-                st.success(f"Updated {selected_ticket_id}.")
-                st.rerun()
-            st.caption("Raw request log")
-            st.code(display_path(OWNER_REQUESTS_FILE), language="text")
-        else:
-            render_panel(
-                "No Support Requests Yet",
-                "When a user asks the assistant to contact the owner, local support requests appear here.",
-            )
-
-    with st.expander("Reference paths and styles", expanded=False):
-        path_cols = st.columns(2)
-        with path_cols[0]:
-            st.markdown("#### Files")
-            st.code("App folder: Panelyra workspace", language="text")
-            st.code(f"Bot script: {display_path(BOT_PATH)}", language="text")
-            st.code(f"History file: {display_path(HISTORY_FILE)}", language="text")
-            st.code(f"Read marker file: {display_path(READ_MARKER_FILE)}", language="text")
-            st.code(f"Research file: {display_path(RESEARCH_FILE)}", language="text")
-        with path_cols[1]:
-            st.markdown("#### Comment Styles")
-            style_cols = st.columns(2)
-            for index, style in enumerate(COMMENT_STYLES):
-                style_cols[index % 2].code(style, language="text")
-
-elif route_page == "Help":
-    render_page_header(
-        "Help",
-        "Plain-language explanation of buttons, fields, research endpoints, and the recommended workflow.",
-        ["Button guide", "Endpoint guide", "Workflow"],
-    )
-    st.markdown("#### Buttons")
-    render_button_guide()
-    st.markdown("#### Fields")
-    st.markdown(
-        """
-        | Field | What it controls |
-        |---|---|
-        | `Starting chapter or series URL` | The first URL the bot opens. It can be a chapter page, reader page, or a series page if chapter links are detectable. |
-        | `Maximum chapters` | Hard stop for how many chapter comment sections the bot processes. |
-        | `Reader routing` | `Auto detect` handles common layouts. Continuous mode finds lower chapter sections on one URL. Next-chapter mode uses chapter links/buttons. Paginated mode reads internal pages before commenting once. Mixed mode separates page and chapter controls. |
-        | `Selector profile` | Supplies separate CSS selectors for Next Chapter, Next Page, page counter, chapter list/dropdown, comment editor, Submit, Thanks, and confirmation. |
-        | `Click Say thanks and mark chapter as read` | Clicks the chapter `Say thanks` button after a successful comment and records the canonical chapter URL in `read_markers.jsonl`. Later runs skip locally marked chapters when possible. |
-        | `Scroll speed` | Preset for page scrolling, visible typing cadence, chapter cooldown, and submit verification wait. |
-        | `Min/Max scroll px` | Manual pixel jump range for each scroll step. Higher values move faster. |
-        | `Min/Max pause sec` | Manual pause range between scroll steps. Lower values move faster. |
-        | `Fallback type min/max sec` | Manual keyboard fallback speed if instant editor fill cannot be used. Lower values type faster. |
-        | `Cooldown min/max sec` | Pause between completed chapters. Ultra fast keeps this near zero; Super fast removes it. |
-        | `Submit verify wait sec` | How long the bot waits for the posted comment to become visible before treating the chapter as failed. |
-        | `Reader mode` | `Auto` detects image-heavy chapters, `Novel text` scrapes page text, and `Manga / Manhwa / Manhua` forces image OCR. |
-        | `Chapter content container` | The page area that holds the chapter. For most comic readers, use the recommended preset and leave this alone. |
-        | `OCR image selector` | Images inside the chapter container. The recommended preset covers normal and lazy-loaded manga, manhwa, and manhua pages. |
-        | `OCR confidence filter` | How strict OCR should be. `0.45` is balanced, higher is cleaner but may miss faint text. |
-        | `Local research file` | Optional JSON file used to enrich generated comments with staging-safe notes. |
-        | `Research endpoint` | Optional local/private HTTP service called as `?q=<chapter title and keywords>`. |
-        """
-    )
-    st.markdown("#### Manual Chapter Selection")
-    st.markdown(
-        """
-        Use `Open Browser / Pick Chapter` when the pasted URL is a series page or when you want to choose a specific chapter yourself.
-        The bot pauses until you click `Start Comments`, and it starts from the page currently open in Chrome.
-        """
-    )
-    st.markdown("#### Research Endpoint")
-    st.markdown(
-        """
-        You do not need a research endpoint. Leave it blank unless you run your own local service.
-
-        If configured, the bot calls:
-
-        ```text
-        http://127.0.0.1:8000/research?q=Chapter Title keyword1 keyword2
-        ```
-
-        It may return plain text, or JSON:
-
-        ```json
-        {
-          "summary": "A short context note for this chapter."
-        }
-        ```
-
-        JSON fields `text` and `context` are also accepted.
-        """
-    )
-    st.markdown("#### AI Assistant")
-    st.markdown(
-        """
-        Open `Assistant` for the full Panelyra Copilot, or use the compact `AI` control from another page.
-
-        - `Ask` explains pages, controls, settings, and workflows from the local Panelyra knowledge base.
-        - `Diagnose` inspects the selected workspace's run record, log events, browser lock, and outputs.
-        - `Configure` extracts a URL and settings, then offers to fill the matching setup form without starting it.
-        - `Support` drafts a user-facing reply and can create a tracked local support ticket.
-        - `Auto` chooses the mode from the request.
-
-        Every answer can show its evidence. Controlled action buttons navigate, fill forms, prepare retries,
-        inspect the active Chrome page, or create a ticket. The copilot does not silently start, stop, submit,
-        delete, publish, or post.
-
-        Browser inspection is optional and user-confirmed. It reads a visible DOM summary from Chrome on port
-        `9222` and can save a screenshot under `outputs/assistant`.
-
-        The local copilot works without an API key. Model enhancement and streamed responses require
-        `OPENAI_API_KEY`:
-
-        ```bash
-        cd "/path/to/Panelyra"
-        cp .env.example .env
-        ```
-
-        Then edit `.env` so it contains:
-
-        ```text
-        OPENAI_API_KEY=sk-your-real-key-here
-        ```
-
-        Restart Streamlit after changing `.env`.
-
-        Web search remains off for site help and diagnostics. It is considered only when `Ask` mode explicitly
-        requests current external research and the web-search setting is enabled.
-
-        Support tickets and assistant ratings are available in `Settings`.
-        """
-    )
-
-render_floating_chat_widget(history_records, status_label)
 persist_workspace_drafts()
 
 should_auto_refresh = any(
     is_process_running(runtime.get("process"))
     for runtime in st.session_state.bot_runtimes.values()
 )
-if should_auto_refresh and route_page in {"Engage Live", "Capture Live", "Studio Live"}:
+if (
+    should_auto_refresh
+    and not is_streamlit_test_session()
+    and not callable(getattr(st, "fragment", None))
+    and route_page in {"Engage Live", "Capture Live"}
+):
     time.sleep(int(st.session_state.auto_refresh_seconds))
     st.rerun()

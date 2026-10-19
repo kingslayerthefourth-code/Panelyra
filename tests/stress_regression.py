@@ -26,7 +26,7 @@ import qa_utils
 from history_utils import append_jsonl_record, read_jsonl_records
 
 
-REPORT_DIR = APP_DIR / "test_reports"
+REPORT_DIR = APP_DIR / "outputs/test-reports"
 DEFAULT_REPORT_PATH = REPORT_DIR / "panelyra_stress_report.json"
 RANDOM_SEED = 20260716
 
@@ -79,6 +79,8 @@ def assert_comment_shape(text: str) -> None:
         raise AssertionError("comment contains repeated spaces")
     if any(ord(char) > 0xFFFF for char in text):
         raise AssertionError("comment contains non-BMP characters unsupported by ChromeDriver")
+    if bot.re.search(r"\bchapters?\b", text, flags=bot.re.IGNORECASE):
+        raise AssertionError(f"comment describes the page instead of the story: {text}")
 
 
 def random_context(index: int) -> bot.ChapterContext:
@@ -137,6 +139,43 @@ def contextual_generation_case(index: int) -> None:
         raise AssertionError(f"unknown style: {generated.style}")
     if generated.research_source and generated.research_source != "local:stress":
         raise AssertionError(f"unexpected research source: {generated.research_source}")
+
+
+def long_history_generation_case() -> None:
+    """Reproduce a 100+ chapter session with recurring characters and conflicts."""
+    used_comments: set[str] = set()
+    history: list[dict[str, object]] = []
+    for index in range(125):
+        changing_detail = f"clue{index}"
+        context = bot.ChapterContext(
+            title=f"Roland and Mira conflict {index}",
+            keywords=["roland", "mira", "betrayal", "choice", changing_detail],
+            excerpt=(
+                f"Roland questions Mira after the betrayal. Their choice turns {changing_detail} "
+                "into evidence, while both characters hide what they know."
+            ),
+            text_length=140,
+        )
+        generated = bot.build_contextual_comment(
+            context,
+            index + 1,
+            used_comments,
+            history,
+            None,
+            reflection_every_n_comments=0,
+        )
+        assert_comment_shape(generated.text)
+        if generated.text in {str(record.get("comment", "")) for record in history}:
+            raise AssertionError(f"duplicate long-run comment at item {index + 1}: {generated.text}")
+        if not (bot.comment_token_set(generated.text) & set(bot.context_story_terms(context))):
+            raise AssertionError(f"comment lost its story anchor at item {index + 1}: {generated.text}")
+        history.append(
+            {
+                "comment": generated.text,
+                "style": generated.style,
+                "keyword": generated.keyword,
+            }
+        )
 
 
 def generic_generation_case(index: int, used_comments: set[str]) -> None:
@@ -237,6 +276,19 @@ def ad_noise_filter_case(index: int) -> None:
     if clean_title != "this chapter":
         raise AssertionError(f"ad-related title was not sanitized: {clean_title}")
 
+    noisy_ocr = (
+        "MerakiScans fastest updates donation methods translated by Bilibili. "
+        "Roland confronts Mira about the betrayal and hides the evidence."
+    )
+    story_keywords = bot.extract_keywords(noisy_ocr, limit=12)
+    leaked_noise = {
+        "merakiscans", "fastest", "updates", "donation", "methods", "translated", "bilibili"
+    } & set(story_keywords)
+    if leaked_noise:
+        raise AssertionError(f"scan-site OCR terms leaked into story keywords: {sorted(leaked_noise)}")
+    if not ({"roland", "mira", "betrayal", "evidence"} & set(story_keywords)):
+        raise AssertionError(f"story keywords were lost after OCR cleanup: {story_keywords}")
+
 
 def subprocess_case(command: list[str], expected_returncode: int, expected_text: str) -> None:
     env = os.environ.copy()
@@ -306,6 +358,7 @@ def main() -> int:
 
         for index in range(320):
             runner.run("contextual_comment_generation", f"contextual-{index}", lambda index=index: contextual_generation_case(index))
+        runner.run("long_history_generation", "long-history-125", long_history_generation_case)
         for index in range(160):
             runner.run("generic_comment_generation", f"generic-{index}", lambda index=index: generic_generation_case(index, generic_used))
         for index in range(160):

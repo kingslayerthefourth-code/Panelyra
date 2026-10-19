@@ -17,6 +17,14 @@ export PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/panelyra_pycache"
 export STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 PANELYRA_PORT="${PANELYRA_PORT:-8517}"
 PANELYRA_OPEN_BROWSER="${PANELYRA_OPEN_BROWSER:-true}"
+SERVER_PID=""
+
+cleanup() {
+  if [ -n "$SERVER_PID" ]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
 
 if [ -x ".venv/bin/python" ]; then
   PYTHON_RUNNER=".venv/bin/python"
@@ -34,6 +42,7 @@ fi
 
 echo "Launching Panelyra Control"
 DASHBOARD_URL="http://127.0.0.1:$PANELYRA_PORT"
+PANELYRA_VERSION="$("$PYTHON_RUNNER" -c 'from panelyra.models.product import PRODUCT_VERSION; print(PRODUCT_VERSION)')"
 
 if curl -fsS --max-time 2 "$DASHBOARD_URL/_stcore/health" >/dev/null 2>&1; then
   echo "Panelyra is already running at $DASHBOARD_URL"
@@ -53,12 +62,10 @@ fi
 
 echo "Dashboard: $DASHBOARD_URL"
 echo "Project: $APP_DIR"
+echo "Build: Panelyra $PANELYRA_VERSION · free local engine"
 echo
 
-"$PYTHON_RUNNER" -m streamlit run panelyra/app.py \
-  --server.port "$PANELYRA_PORT" \
-  --server.headless false \
-  --browser.gatherUsageStats false &
+"$PYTHON_RUNNER" -m panelyra.engine --root "$APP_DIR" --port "$PANELYRA_PORT" &
 SERVER_PID=$!
 
 if [ "$PANELYRA_OPEN_BROWSER" = "true" ]; then

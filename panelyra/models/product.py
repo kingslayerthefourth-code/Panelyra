@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 
 PRODUCT_NAME = "Panelyra"
-PRODUCT_TAGLINE = "Automation for every chapter."
-PRODUCT_VERSION = "0.12.0"
+PRODUCT_TAGLINE = "Your chapters, in one place."
+PRODUCT_VERSION = "0.16.0"
 PRODUCT_MODE = "Local-only"
 
 
@@ -32,12 +32,6 @@ WORKSPACES = {
         description="Collect chapter images, CBZ archives, and OCR transcripts.",
         accent="green",
     ),
-    "studio": Workspace(
-        key="studio",
-        name="Panelyra Studio",
-        description="Compose Word Art, upload media, and verify editor save workflows.",
-        accent="violet",
-    ),
     "control": Workspace(
         key="control",
         name="Panelyra Control",
@@ -48,16 +42,10 @@ WORKSPACES = {
 
 
 NAVIGATION_GROUPS = {
-    "Workspace": ["Dashboard", "Reader", "Engage", "Capture", "Studio"],
-    "Operations": ["Assistant", "Run History", "Settings", "Help"],
+    "Library & downloads": ["Library", "Downloads", "Capture"],
+    "Tools": ["Engage", "Activity", "Settings"],
 }
-
-
-PAGE_RUNTIME_TYPES = {
-    "Engage": "comment",
-    "Capture": "download",
-    "Studio": "word_art",
-}
+PAGE_RUNTIME_TYPES = {"Engage": "comment", "Capture": "download"}
 
 
 def runtime_type_for_page(page: str) -> str:
