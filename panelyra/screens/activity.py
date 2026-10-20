@@ -1,6 +1,27 @@
 """Activity screen."""
 from __future__ import annotations
 
+def download_run_records(root=None):
+    """Present genuine durable Downloads jobs alongside legacy run receipts."""
+    from pathlib import Path
+    from panelyra.automation.download_queue import read_queue, SUCCESS
+    root = Path(root) if root is not None else Path(__file__).resolve().parents[2]
+    records = []
+    for job in read_queue(root)['jobs']:
+        chapters = job.get('chapters', {})
+        records.append({
+            'bot_type': 'manga_download', 'run_id': job['id'],
+            'title': job.get('title') or 'Chapter download',
+            'status': job['status'],
+            'stage': 'Ready in Library' if job['status'] == 'completed' else job['status'].replace('_', ' ').title(),
+            'progress_current': sum(c.get('status') in SUCCESS for c in chapters.values()),
+            'progress_total': len(chapters), 'updated_at': job.get('updated_at', 0),
+            'settings': {'series': job.get('title', ''), 'source': job.get('source', ''),
+                         'series_url': job.get('series_url', ''), 'chapters': ', '.join(chapters)},
+            'stop_reason': '; '.join(dict.fromkeys(c['error'] for c in chapters.values() if c.get('error'))),
+        })
+    return records
+
 def render(*, display_path, json, list_run_records, redact_private_paths, render_page_header, restore_run_configuration, set_page, st, time, uuid):
     render_page_header(
         "Activity",
@@ -8,6 +29,10 @@ def render(*, display_path, json, list_run_records, redact_private_paths, render
         ["Searchable records", "JSON export", "Retry setup"],
     )
     records = list_run_records(limit=100)
+    try:
+        records = sorted(records + download_run_records(), key=lambda r: r.get('updated_at', 0), reverse=True)[:100]
+    except (OSError, ValueError) as exc:
+        st.warning(f'Download receipts are unavailable: {exc}')
     filter_columns = st.columns([2, 1, 1])
     history_search = filter_columns[0].text_input(
         "Search",
@@ -16,13 +41,13 @@ def render(*, display_path, json, list_run_records, redact_private_paths, render
     ).strip().lower()
     bot_filter = filter_columns[1].selectbox(
         "Workspace",
-        options=["All", "Engage", "Capture", "Studio (retired)"],
+        options=["All", "Downloads", "Engage", "Capture", "Studio (retired)"],
     )
     status_filter = filter_columns[2].selectbox(
         "Status",
         options=["All", "running", "completed", "partial", "failed", "stopped"],
     )
-    bot_values = {"Engage": "comment", "Capture": "download", "Studio (retired)": "word_art"}
+    bot_values = {"Downloads": "manga_download", "Engage": "comment", "Capture": "download", "Studio (retired)": "word_art"}
     if bot_filter != "All":
         records = [record for record in records if record.get("bot_type") == bot_values[bot_filter]]
     if status_filter != "All":
@@ -45,8 +70,10 @@ def render(*, display_path, json, list_run_records, redact_private_paths, render
         st.info("No matching runs. Downloads, Capture and Engage runs appear here.")
     else:
         for record in records:
+            label = 'Downloads' if record.get('bot_type') == 'manga_download' else record.get('bot_type', 'bot').replace('_', ' ').title()
+            title = f" · {record['title']}" if record.get('title') else ''
             with st.expander(
-                f"{record.get('bot_type', 'bot').replace('_', ' ').title()} · {record.get('status', 'unknown')} · {record.get('run_id', '')}",
+                f"{label}{title} · {record.get('status', 'unknown')} · {record.get('run_id', '')}",
                 expanded=False,
             ):
                 cols = st.columns(4)
@@ -60,6 +87,12 @@ def render(*, display_path, json, list_run_records, redact_private_paths, render
                 if record.get("log_path"):
                     st.caption(display_path(record["log_path"]))
                 run_id = str(record.get("run_id", uuid.uuid4().hex))
+                if record.get('bot_type') == 'manga_download':
+                    if st.button('Open download queue', key=f'queue_receipt_{run_id}', width='stretch'):
+                        st.session_state.manga_download_tab = 'Queue'
+                        set_page('Downloads')
+                        st.rerun()
+                    continue
                 history_actions = st.columns(1)
                 if history_actions[0].button(
                     "Retry from saved configuration",

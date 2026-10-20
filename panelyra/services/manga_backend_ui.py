@@ -191,11 +191,12 @@ def _render_downloads() -> None:
 
 def render_manga_backend() -> None:
     import streamlit as st
-    @st.fragment
-    def workspace():
-        with st.container(key="manga_download_workspace"):
-            _render_manga_backend()
-    workspace()
+    # Availability, live receipts and queue panels already own their polling
+    # fragments. Nesting them inside another fragment re-registers the child
+    # widgets during a form submission and can interrupt queue creation with
+    # a duplicate-key error when the chapter catalog finishes at the same time.
+    with st.container(key="manga_download_workspace"):
+        _render_manga_backend()
 
 
 def _render_manga_backend() -> None:

@@ -535,10 +535,11 @@ def render_cleaner_review(catalog: dict[str, dict[str, object]]) -> None:
                 st.success(f"Cleaned Chapter {review_chapter}. CBZ rebuilt at {display_path(result.archive_file)}.")
                 st.cache_data.clear()
                 queue = [value for value in st.session_state.reader_clean_batch if value != review_chapter]
-                st.session_state.reader_clean_batch = queue
+                st.session_state._reader_clean_transition = {
+                    'queue': queue, 'chapter': queue[0] if queue else None,
+                }
                 if queue:
                     next_chapter = queue[0]
-                    st.session_state.reader_chapter = next_chapter
                     start_clean_review(selected_series, next_chapter, Path(original_chapters[next_chapter]["chapter_dir"]))
                 else:
                     st.session_state.reader_clean_review = {}
@@ -4189,7 +4190,10 @@ def set_page(page: str) -> None:
         workspace, view = LEGACY_PAGE_ROUTES[page]
         st.session_state.page = workspace
         if view:
-            st.session_state[f"{workspace.lower()}_view"] = view
+            # A launch button may run after this workspace's View widget has
+            # already been rendered. Apply its destination before that widget
+            # is constructed on the next run, not to an instantiated key.
+            st.session_state._workspace_view_request = (workspace, view)
         if previous_page != workspace:
             request_scroll_to_top()
         return
@@ -4240,6 +4244,9 @@ def render_scroll_to_top_trigger() -> None:
 
 
 def render_workspace_view(page: str) -> str:
+    requested = st.session_state.pop('_workspace_view_request', None)
+    if requested and requested[0] == page:
+        st.session_state[f'{page.lower()}_view'] = requested[1]
     views = WORKSPACE_VIEW_ROUTES.get(page)
     if not views:
         return page

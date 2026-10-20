@@ -1,5 +1,6 @@
 """Concurrency and navigation checks for incremental title discovery; no network."""
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from threading import Event
@@ -13,6 +14,13 @@ ROW = {"title": "Investment Playbook", "url": "https://example.com/manga/book", 
 
 
 class SeamlessDownloads(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        guard = patch('panelyra.automation.manga_backend.ROOT', Path(temp.name))
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def test_first_match_is_available_before_slow_sources_finish(self):
         first = Event()
         finish = Event()

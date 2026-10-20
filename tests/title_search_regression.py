@@ -1,5 +1,6 @@
 """Offline title discovery and UI integration tests; no network or downloads."""
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +11,12 @@ from panelyra.services.title_search import _pagination_items, parse_madara, pars
 
 class TitleSearchTests(unittest.TestCase):
     def setUp(self):
+        # UI unit tests must never scan the user's production library/database.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        guard = patch('panelyra.automation.manga_backend.ROOT', Path(temp.name))
+        guard.start()
+        self.addCleanup(guard.stop)
         for name, value in (
             ("panelyra.services.chapter_counts.get_chapter_count", {"chapter_count": None, "chapter_count_kind": "unknown"}),
             ("panelyra.services.chapter_availability.get_catalog", {"chapters": {}, "complete": False}),

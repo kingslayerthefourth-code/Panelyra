@@ -1,9 +1,20 @@
 """Library screen."""
 from __future__ import annotations
 
+def apply_clean_transition(st):
+    """Move the review queue before Streamlit instantiates its bound widgets."""
+    transition = st.session_state.pop('_reader_clean_transition', None)
+    if transition is not None:
+        st.session_state.reader_clean_batch = transition['queue']
+        if transition.get('chapter'):
+            st.session_state.reader_chapter = transition['chapter']
+
 def render(*, APP_DIR, PANELYRA_LOG_DIR, Path, READER_PROGRESS_FILE, ReaderProgressStore, _chapter_integrity, _chapter_number, _reader_cover_data, html, is_process_running, json, local_reader_service, reader_catalog, render_cleaner_review, render_page_header, set_page, st, start_clean_review, subprocess, sys):
     from urllib.parse import urlencode
     from tablet_ui import render_chapter_delivery
+    # Apply cleaner transitions before the chapter/queue widgets are created.
+    # Streamlit rejects assigning a widget-backed key later in the same run.
+    apply_clean_transition(st)
     restored_query = st.query_params.get('library_search')
     if restored_query is not None and st.session_state.get('_restored_library_query') != restored_query:
         st.session_state.library_search = restored_query
